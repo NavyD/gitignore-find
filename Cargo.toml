@@ -1,0 +1,24 @@
+[package]
+name = "gitignore-find"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "gitignore_find"
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1.0.79"
+dashmap = "5.5.3"
+env_logger = "0.11.0"
+git2 = { version = "0.18.1", default-features = false }
+globset = "0.4.14"
+itertools = "0.12.0"
+jwalk = "0.8.1"
+log = "0.4.20"
+pyo3 = { version = "0.20", features = ["extension-module", "anyhow"] }
+walkdir = "2.4.0"
+
+[dev-dependencies]
+ctor = "0.2.6"
