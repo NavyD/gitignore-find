@@ -1,201 +1,153 @@
 use std::{
     collections::HashSet,
     fmt::Debug,
+    hash::Hash,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
-use anyhow::{anyhow, bail, Context, Error, Result};
-use dashmap::DashSet;
-use git2::{ErrorCode, Repository};
+use anyhow::{Error, Result};
 use globset::{GlobBuilder, GlobSetBuilder};
-use itertools::{Either, Itertools};
+use ignore::gitignore::Gitignore;
+use itertools::Itertools;
 use jwalk::{rayon::prelude::*, WalkDir};
-use log::{debug, log_enabled, trace};
+use log::{debug, trace};
 use pyo3::{
     prelude::*,
     types::{PyList, PyString},
 };
 
-/// Formats the sum of two numbers as string.
-#[pyfunction]
-fn sum_as_string(a: usize, b: usize) -> PyResult<String> {
-    Ok((a + b).to_string())
-}
-
 /// A Python module implemented in Rust.
 #[pymodule]
 fn gitignore_find(_py: Python, m: &PyModule) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(sum_as_string, m)?)?;
     m.add_function(wrap_pyfunction!(find_ignoreds, m)?)?;
     Ok(())
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, excludes=None))]
-// fn find_ignoreds(path: &PyString, excludes: Option<&PyList>) -> Result<Vec<String>> {
 fn find_ignoreds(path: &PyString, excludes: Option<&PyList>) -> Result<Vec<PathBuf>> {
     let path = path.to_str()?;
     let excludes = excludes
         .map(|e| e.extract::<Vec<&str>>())
         .unwrap_or_else(|| Ok(vec![]))?;
 
-    find(path, excludes).map(|i| i.collect::<Vec<_>>())
+    let paths = find_paths(path, excludes)?;
+    let ignoreds = find_gitignoreds(paths).sorted().collect_vec();
+    Ok(ignoreds)
 }
 
-fn find<P, Q>(path: P, excludes: Q) -> Result<impl Iterator<Item = PathBuf>>
+fn find_paths<'a, P, I>(path: P, excludes: I) -> Result<Vec<PathBuf>>
 where
     P: AsRef<Path>,
-    Q: IntoIterator,
-    Q::Item: Into<String>,
+    I: IntoIterator<Item = &'a str>,
 {
-    let path = path.as_ref();
-    let all_paths = find_all_paths(path, excludes).unwrap();
-    debug!("Finding ignoreds in {}", path.display());
-    let ignoreds = DashSet::new();
-    all_paths
-        .par_iter()
-        .filter(|p| !ignoreds.contains(*p) && p.is_dir())
-        .try_for_each(|p| {
-            let repo_paths = all_paths
-                .iter()
-                .filter(|ap| ap.starts_with(p))
-                .collect_vec();
-            trace!(
-                "Checking if {} paths of git repo {} has ignoreds",
-                repo_paths.len(),
-                p.display()
-            );
-            match find_ignoreds_in_repo(p, repo_paths) {
-                Ok(sub_ignoreds) => {
-                    let sub_ignoreds = sub_ignoreds.collect_vec();
-                    debug!(
-                        "Found {} ignoreds paths in repo {}",
-                        sub_ignoreds.len(),
-                        p.display()
-                    );
-                    for subp in sub_ignoreds {
-                        ignoreds.insert(subp.clone());
-                    }
-                }
-                Err(e) => {
-                    if let Some(git_err) = e.downcast_ref::<git2::Error>() {
-                        // ignore invalid git dir
-                        if matches!(git_err.code(), ErrorCode::NotFound) {
-                            return Ok(());
-                        }
-                    }
-                    return Err(e);
-                }
-            }
-            Ok::<_, Error>(())
-        })?;
-    Ok(ignoreds.into_iter())
-}
-
-fn find_all_paths<P, Q>(path: P, excludes: Q) -> Result<Vec<PathBuf>>
-where
-    P: AsRef<Path>,
-    Q: IntoIterator,
-    Q::Item: Into<String>,
-{
-    // trace!(
-    //     "Converting glob set from {} excludes patterns: {:?}",
-    //     excludes.len(),
-    //     excludes
-    // );
     let exclude_pat = excludes
         .into_iter()
         .try_fold(GlobSetBuilder::new(), |mut gs, s| {
-            let glob = GlobBuilder::new(&s.into())
-                .literal_separator(true)
-                .build()?;
+            let glob = GlobBuilder::new(s).literal_separator(true).build()?;
             gs.add(glob);
             Ok::<_, Error>(gs)
         })
         .and_then(|b| b.build().map_err(Into::into))?;
-    let path = path.as_ref().canonicalize()?;
-    debug!("Traversing all paths under directory {}", path.display());
-    let all_paths = WalkDir::new(&path)
+    let path = path.as_ref();
+
+    debug!("Traversing all paths in directory {}", path.display());
+    WalkDir::new(path)
         .sort(true)
+        .skip_hidden(false)
         .process_read_dir(move |_depth, _path, _read_dir_state, children| {
             // let exclude_pat = exclude_pat.lock().unwrap();
-            children.retain(|dir_ent| {
-                dir_ent
-                    .as_ref()
-                    .map(|ent| !exclude_pat.is_match(ent.path()))
-                    .unwrap_or(false)
-            });
+            if !exclude_pat.is_empty() {
+                children.retain(|dir_ent| {
+                    dir_ent
+                        .as_ref()
+                        .map(|ent| !exclude_pat.is_match(ent.path()))
+                        .unwrap_or(false)
+                });
+            }
         })
         .into_iter()
         .map(|dir_ent| dir_ent.map(|e| e.path()).map_err(Into::into))
-        .collect::<Result<Vec<_>>>()?;
-    debug!("Found {} paths in {}", all_paths.len(), path.display());
-    Ok(all_paths)
+        .collect::<Result<Vec<_>>>()
 }
 
-fn find_ignoreds_in_repo<P, Q, I>(path: P, repo_paths: I) -> Result<impl Iterator<Item = Q>>
+fn find_gitignoreds<I, P>(paths: I) -> impl Iterator<Item = P>
 where
-    P: AsRef<Path> + Debug,
-    Q: AsRef<Path> + Debug,
-    I: IntoIterator<Item = Q>,
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path> + Send + Sync + Debug + Eq + Hash + Ord,
 {
-    let path = path.as_ref().canonicalize()?;
-    trace!("Opening git repo in {}", path.display());
-    let repo = Repository::open(&path)?;
-
-    let (results, errors): (Vec<_>, Vec<_>) = repo_paths
-        .into_iter()
-        .map(|p| repo.is_path_ignored(p.as_ref()).map(|ignored| (ignored, p)))
-        .partition(|r| r.is_ok());
-    let errors = errors
-        .into_iter()
-        .map(|r| r.map_err(Into::<anyhow::Error>::into))
-        .map(Result::unwrap_err)
-        .collect::<Vec<_>>();
-    if !errors.is_empty() {
-        bail!("Found ignore errors: {:?}", errors)
-    }
-
-    let (mut ignoreds, _) = results
-        .into_iter()
-        .map(Result::unwrap)
-        .partition_map::<Vec<_>, Vec<_>, _, _, _>(|(ignored, p)| {
-            if ignored {
-                Either::Left(p)
-            } else {
-                Either::Right(p)
+    let paths = paths.into_iter().map(Arc::new).collect_vec();
+    let ignoreds = paths
+        .par_iter()
+        .filter(|p| p.as_ref().as_ref().ends_with(".gitignore") && p.as_ref().as_ref().is_file())
+        .filter_map(|path| {
+            let path = path.as_ref().as_ref();
+            trace!("Loading gitignore rule from {}", path.display());
+            let (gi, err) = Gitignore::new(path);
+            if let Some(e) = err {
+                debug!(
+                    "Ignore loaded gitignore rule error in {}: {}",
+                    path.display(),
+                    e
+                );
             }
-        });
-    trace!(
-        "Found {} ignored paths in repo {}",
-        ignoreds.len(),
-        path.display()
-    );
-
-    // merge sub path to parent
-    ignoreds.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
-    // TODO: 如何解决vec自引用循环中的问题
-    let ignoreds_set = ignoreds
-        .iter()
-        .map(|p| p.as_ref().to_path_buf())
+            path.parent().map(|dir| {
+                let cur_ignoreds = paths
+                    .iter()
+                    .filter(|p| {
+                        let p = p.as_ref().as_ref();
+                        p != dir && p.starts_with(dir) && gi.matched(p, p.is_dir()).is_ignore()
+                    })
+                    .collect_vec();
+                debug!(
+                    "Found {} ignoreds paths in {}",
+                    cur_ignoreds.len(),
+                    dir.display()
+                );
+                let set = cur_ignoreds
+                    .iter()
+                    .map(AsRef::as_ref)
+                    .map(AsRef::as_ref)
+                    .collect::<HashSet<_>>();
+                let mergeds = cur_ignoreds
+                    .iter()
+                    .filter(|p| {
+                        p.as_ref()
+                            .as_ref()
+                            .ancestors()
+                            .skip(1)
+                            .all(|pp| !set.contains(pp))
+                    })
+                    .copied()
+                    .collect_vec();
+                trace!(
+                    "Merged {} ignored paths in {}: {:?}",
+                    mergeds.len(),
+                    dir.display(),
+                    mergeds
+                );
+                mergeds
+            })
+        })
+        .flatten()
+        .map(Arc::clone)
         .collect::<HashSet<_>>();
-    Ok(ignoreds.into_iter().filter(move |p| {
-        p.as_ref()
-            .ancestors()
-            // 跳过当前path
-            .skip(1)
-            .all(|pp| !ignoreds_set.contains(pp))
-    }))
+
+    drop(paths);
+
+    ignoreds
+        .into_iter()
+        // safety: paths has dropped
+        .map(|p| Arc::try_unwrap(p).unwrap())
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Once;
 
-    use log::LevelFilter;
-
     use super::*;
+    use log::LevelFilter;
+    use pretty_assertions::assert_eq;
 
     #[ctor::ctor]
     fn init() {
@@ -211,35 +163,55 @@ mod tests {
 
     #[test]
     fn test_find_all_paths() -> Result<()> {
-        let path = Path::new("../lede");
-        let repo_paths = find_all_paths::<_, &[String]>(path, &[])?;
-        for p in repo_paths {
-            println!("{}", p.display());
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn test_find_ignoreds_in_this_repo() -> Result<()> {
         let path = Path::new(".");
-        let repo_paths = find_all_paths::<_, &[String]>(path, &[])?;
-        let pp = repo_paths.iter().map(|p| p.to_str().unwrap()).collect_vec();
-        let ignoreds = find_ignoreds_in_repo(".", repo_paths)?.collect_vec();
-        assert!(!ignoreds.is_empty());
-        assert_eq!(path.canonicalize()?.join("target"), ignoreds[0]);
+        let paths = find_paths(path, [])?.into_iter().sorted().collect_vec();
+        assert!(!paths.is_empty());
+        assert!(paths.contains(&path.join("target")));
+        assert!(paths.contains(&path.join(".git")));
+        assert!(paths.contains(&path.join(".gitignore")));
+
+        let expect_paths = walkdir::WalkDir::new(path)
+            .into_iter()
+            .map(|ent| ent.map(|e| e.into_path()).map_err(Into::into))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .sorted()
+            .collect_vec();
+        assert_eq!(paths, expect_paths);
         Ok(())
     }
 
     #[test]
-    fn test_find() -> Result<()> {
-        let path = Path::new("../lede");
-        // let ignoreds = find(path, ["**/.git/**"])?.collect_vec();
-        let repo_paths = find_all_paths::<_, &[String]>(path, &[])?;
-        assert!(repo_paths.contains(&path.join("bin")));
-        // let ignoreds = find::<_, &[String]>("../lede", &[])?.collect_vec();
-        // assert!(!ignoreds.is_empty());
-        // println!("{} {:?}", ignoreds.len(), ignoreds);
+    fn test_find_gitignoreds() -> Result<()> {
+        let base = Path::new("/home/navyd/Workspaces/projects/gitignore-find/");
+        let paths = find_paths(base, [])?;
+        assert!(
+            paths.iter().any(|p| p.ends_with(".gitignore")),
+            "gitignore file exists"
+        );
+        let ignoreds = find_gitignoreds(&paths).collect_vec();
+        assert!(!ignoreds.is_empty());
+        assert!(ignoreds.contains(&&base.join("target")));
+        assert!(ignoreds.contains(&&base.join(".venv")));
 
+        // let base = Path::new("/home/navyd/.local/share/chezmoi");
+        // let paths = find_paths(base, [])?;
+        // assert!(
+        //     paths.iter().any(|p| p.ends_with(".gitignore")),
+        //     "gitignore file exists"
+        // );
+        // let ignoreds = find_gitignoreds(&paths).collect_vec();
+        // assert!(!ignoreds.is_empty());
+        // assert!(ignoreds.contains(&&base.join("build/.resticignore")));
+
+        // let base = Path::new("/home/navyd/Workspaces/projects");
+        // let paths = find_paths(base, [])?;
+        // assert!(
+        //     paths.iter().any(|p| p.ends_with(".gitignore")),
+        //     "gitignore file exists"
+        // );
+        // let ignoreds = find_gitignoreds(&paths).collect_vec();
+        // assert!(!ignoreds.is_empty());
         Ok(())
     }
 }
