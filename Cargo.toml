@@ -1,6 +1,6 @@
 [package]
 name = "gitignore-find"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -10,7 +10,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 anyhow = "1.0.79"
-env_logger = "0.11.0"
 globset = "0.4.14"
 ignore = "0.4.22"
 itertools = "0.12.0"
@@ -19,6 +18,7 @@ log = "0.4.20"
 pyo3 = { version = "0.20", features = ["extension-module", "anyhow"] }
 
 [dev-dependencies]
+env_logger = "0.11.0"
 ctor = "0.2.6"
 walkdir = "2.4.0"
 pretty_assertions = "1.4.0"
