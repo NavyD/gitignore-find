@@ -135,7 +135,22 @@ where
 
     drop(paths);
 
+    let ignoreds_set = ignoreds
+        .iter()
+        .map(|p| p.as_ref().as_ref())
+        .collect::<HashSet<_>>();
     ignoreds
+        .iter()
+        // 合并已存在的子路径
+        .filter(|p| {
+            p.as_ref()
+                .as_ref()
+                .ancestors()
+                .skip(1)
+                .all(|pp| !ignoreds_set.contains(pp))
+        })
+        .map(Arc::clone)
+        .collect::<Vec<_>>()
         .into_iter()
         // safety: paths has dropped
         .map(|p| Arc::try_unwrap(p).unwrap())
@@ -183,7 +198,7 @@ mod tests {
 
     #[test]
     fn test_find_gitignoreds() -> Result<()> {
-        let base = Path::new("/home/navyd/Workspaces/projects/gitignore-find/");
+        let base = Path::new(".");
         let paths = find_paths(base, [])?;
         assert!(
             paths.iter().any(|p| p.ends_with(".gitignore")),
@@ -204,7 +219,7 @@ mod tests {
         // assert!(!ignoreds.is_empty());
         // assert!(ignoreds.contains(&&base.join("build/.resticignore")));
 
-        // let base = Path::new("/home/navyd/Workspaces/projects");
+        // let base = Path::new("/home/navyd/");
         // let paths = find_paths(base, [])?;
         // assert!(
         //     paths.iter().any(|p| p.ends_with(".gitignore")),
