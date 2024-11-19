@@ -12,13 +12,13 @@ crate-type = ["cdylib"]
 anyhow = "1.0"
 globset = "0.4"
 ignore = "0.4"
-itertools = "0.12"
+itertools = "0.13"
 jwalk = "0.8"
 log = "0.4"
-pyo3 = { version = "0.20", features = ["extension-module", "anyhow"] }
+pyo3 = { version = "0.23", features = ["extension-module", "anyhow"] }
 
 [dev-dependencies]
 env_logger = "0.11"
 ctor = "0.2"
-walkdir = "2.4"
+walkdir = "2.5"
 pretty_assertions = "1.4"

@@ -12,23 +12,20 @@ use ignore::gitignore::Gitignore;
 use itertools::Itertools;
 use jwalk::{rayon::prelude::*, WalkDir};
 use log::{debug, trace};
-use pyo3::{
-    prelude::*,
-    types::{PyList, PyString},
-};
+use pyo3::{prelude::*, types::PySequence};
 
 /// A Python module implemented in Rust.
 #[pymodule]
-fn gitignore_find(_py: Python, m: &PyModule) -> PyResult<()> {
+fn gitignore_find(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(find_ignoreds, m)?)?;
     Ok(())
 }
 
 #[pyfunction]
-fn find_ignoreds(path: &PyString, excludes: Option<&PyList>) -> Result<Vec<PathBuf>> {
-    let path = path.to_str()?;
+#[pyo3(signature = (path, excludes=None))]
+fn find_ignoreds(path: &str, excludes: Option<&Bound<'_, PySequence>>) -> Result<Vec<PathBuf>> {
     let excludes = excludes
-        .map(|e| e.extract::<Vec<&str>>())
+        .map(|e| e.extract::<Vec<String>>())
         .unwrap_or_else(|| Ok(vec![]))?;
 
     let paths = find_paths(path, excludes)?;
@@ -36,15 +33,18 @@ fn find_ignoreds(path: &PyString, excludes: Option<&PyList>) -> Result<Vec<PathB
     Ok(ignoreds)
 }
 
-fn find_paths<'a, P, I>(path: P, excludes: I) -> Result<Vec<PathBuf>>
+fn find_paths<P, I, S>(path: P, excludes: I) -> Result<Vec<PathBuf>>
 where
     P: AsRef<Path>,
-    I: IntoIterator<Item = &'a str>,
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
 {
     let exclude_pat = excludes
         .into_iter()
         .try_fold(GlobSetBuilder::new(), |mut gs, s| {
-            let glob = GlobBuilder::new(s).literal_separator(true).build()?;
+            let glob = GlobBuilder::new(s.as_ref())
+                .literal_separator(true)
+                .build()?;
             gs.add(glob);
             Ok::<_, Error>(gs)
         })
@@ -179,7 +179,10 @@ mod tests {
     #[test]
     fn test_find_all_paths() -> Result<()> {
         let path = Path::new(".");
-        let paths = find_paths(path, [])?.into_iter().sorted().collect_vec();
+        let paths = find_paths::<_, _, &str>(path, [])?
+            .into_iter()
+            .sorted()
+            .collect_vec();
         assert!(!paths.is_empty());
         assert!(paths.contains(&path.join("target")));
         assert!(paths.contains(&path.join(".git")));
@@ -199,7 +202,7 @@ mod tests {
     #[test]
     fn test_find_gitignoreds() -> Result<()> {
         let base = Path::new(".");
-        let paths = find_paths(base, [])?;
+        let paths = find_paths::<_, _, &str>(base, [])?;
         assert!(
             paths.iter().any(|p| p.ends_with(".gitignore")),
             "gitignore file exists"
