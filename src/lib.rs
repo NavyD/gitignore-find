@@ -1,5 +1,4 @@
 use std::{
-    collections::{HashMap, HashSet},
     fmt::Debug,
     hash::Hash,
     ops::Deref,
@@ -9,6 +8,7 @@ use std::{
 
 use anyhow::{Error, Result};
 use globset::{GlobBuilder, GlobSetBuilder};
+use hashbrown::HashMap;
 use ignore::gitignore::Gitignore;
 use itertools::Itertools;
 use jwalk::{rayon::prelude::*, WalkDir};
@@ -18,13 +18,19 @@ use pyo3::{
     types::{PySequence, PyString},
 };
 use sha2::{Digest, Sha256};
-use smallvec::SmallVec;
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 /// A Python module implemented in Rust.
 #[pymodule]
 fn gitignore_find(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // TODO: 等待兼容pyo3 0.23版本 https://github.com/vorner/pyo3-log
-    // pyo3_log::init();
+    pyo3_log::Logger::new(m.py(), pyo3_log::Caching::LoggersAndLevels)?
+        // 仅启用当前模块的log否则可能有其它模块如ignore
+        .filter(log::LevelFilter::Warn)
+        .filter_target(env!("CARGO_CRATE_NAME").to_owned(), log::LevelFilter::Trace)
+        .install()
+        .unwrap();
     m.add_function(wrap_pyfunction!(find_ignoreds, m)?)?;
     Ok(())
 }
@@ -49,14 +55,7 @@ fn find_ignoreds(
     let exclude_ignoreds = exclude_ignoreds
         .map(|e| e.extract::<Vec<String>>())
         .unwrap_or_else(|| Ok(vec![]))?;
-    debug!(
-        "Finding git ignored paths with exclude globs \
-        {:?} and exclude ignored globs {:?} in paths: {:?}",
-        excludes, exclude_ignoreds, paths
-    );
-    let ignoreds = find(paths, excludes, exclude_ignoreds)?;
-    debug!("Found {} ignored paths: {:?}", ignoreds.len(), ignoreds);
-    Ok(ignoreds)
+    find(paths, excludes, exclude_ignoreds)
 }
 
 pub fn find(
@@ -93,7 +92,8 @@ pub fn find(
     // SAFETY: only one ref
     .map(|p| Arc::try_unwrap(p).unwrap())
     .collect::<Vec<PathBuf>>();
-    debug!("Found {} ignored paths: {:?}", ignoreds.len(), ignoreds);
+
+    trace!("Found {} ignored paths: {:?}", ignoreds.len(), ignoreds);
     Ok(ignoreds)
 }
 
@@ -222,75 +222,64 @@ where
     I: IntoIterator<Item = E>,
     E: Deref<Target = P> + Clone + Debug + Send + Sync + Eq + Hash + Ord,
     P: AsRef<Path>,
-    T: PathPattern + Send + Sync,
+    T: PathPattern + Send + Sync + Debug,
 {
     let paths = paths.into_iter().collect::<Vec<_>>();
     let merge_paths = MergePaths::new(paths.iter().map(|p| p.as_ref()));
+
+    debug!("Finding .gitignore files in {} paths", paths.len());
+    let gitignoreds = paths
+        .iter()
+        .map(|p| p.as_ref())
+        .filter(|path| {
+            (exclude_pat.is_empty() || !exclude_pat.is_match(path))
+                && path.ends_with(".gitignore")
+                && path.is_file()
+        })
+        .map(|p| {
+            let (gi, err) = Gitignore::new(p);
+            if let Some(e) = err {
+                warn!("Ignore load gitignore rule error in {}: {}", p.display(), e);
+            }
+            gi
+        })
+        .collect::<Vec<_>>();
+
+    #[cfg(debug_assertions)]
+    trace!(
+        "Found {} .gitignore files: {:?}",
+        gitignoreds.len(),
+        gitignoreds
+    );
+
+    debug!(
+        "Finding ignored paths with {} gitignores and exclude pattern {:?} from all {} paths",
+        gitignoreds.len(),
+        exclude_pat,
+        paths.len()
+    );
     let ignoreds = paths
         .par_iter()
-        .filter_map(|path| {
-            let path: &Path = path.as_ref();
-            // 跳过非gitignore的目录
-            if !path.ends_with(".gitignore") || !path.is_file() {
-                return None;
-            }
-
-            trace!("Loading gitignore rule from {}", path.display());
-            let (gi, err) = Gitignore::new(path);
-            if let Some(e) = err {
-                warn!(
-                    "Ignore loaded gitignore rule error in {}: {}",
-                    path.display(),
-                    e
-                );
-            }
-
-            #[cfg(debug_assertions)]
-            {
-                let txt = match std::fs::read_to_string(path) {
-                    Ok(s) => s,
-                    Err(e) => format!("Failed to reading path {} by error: {}", path.display(), e),
-                };
-                trace!(
-                    "Loaded gitignore {} rules for gitignore content: {}",
-                    gi.len(),
-                    txt.replace("\r\n", "\\r\\n").replace("\n", "\\n")
-                );
-            }
-
-            let dir: &Path = path.parent()?;
-            // 获取除了 被排除 的所有路径
-            let cur_ignoreds = paths
-                .par_iter()
-                .filter(|path| {
-                    let p = path.as_ref();
-                    p != dir
-                        && p.starts_with(dir)
+        .filter(|p| {
+            let p = p.as_ref();
+            (exclude_pat.is_empty() || !exclude_pat.is_match(p))
+                && gitignoreds.iter().any(|gi| {
+                    p.starts_with(gi.path())
                         && (
                             // gi只匹配文件夹而不会对其中的文件匹配如`.venv`规则不会匹配`.venv/bin/test.sh`会导致忽略的路径不包含子路径
                             // 添加新条件以匹配子路径
                             gi.matched(p, p.is_dir()).is_ignore()
                                 || p.ancestors()
                                     .skip(1)
+                                    // 仅限制在gitignore目录内
+                                    .take_while(|pp| pp.starts_with(gi.path()))
                                     // pp必然是dir
                                     .any(|pp| gi.matched(pp, true).is_ignore())
                         )
                 })
-                // 过滤不需要忽略的路径
-                .filter(|p| exclude_pat.is_empty() || !exclude_pat.is_match(p.as_ref()))
-                .collect::<Vec<_>>();
-            #[cfg(debug_assertions)]
-            trace!(
-                "Found {} ignoreds paths in directory {}: {:?}",
-                cur_ignoreds.len(),
-                dir.display(),
-                cur_ignoreds,
-            );
-            Some(cur_ignoreds)
         })
-        .flatten()
         .cloned()
-        .collect::<HashSet<_>>();
+        .collect::<Vec<_>>();
     debug!(
         "Mergeing {} ignored paths in {} paths",
         ignoreds.len(),
@@ -354,18 +343,26 @@ impl<'p> MergePaths<'p> {
         // 保存路径对应的子路径  如果一个路径没有子路径则为空
         let one_tier_subpaths = paths.iter().copied().fold(
             HashMap::new(),
-            |mut path_subpaths: HashMap<&Path, SmallVec<[&Path; 4]>>, p| {
+            |mut path_subpaths: HashMap<&Path, Option<Vec<&Path>>>, p| {
+                // 为所有路径默认添加子路径为None
                 path_subpaths.entry(p).or_default();
-                if let Some(pp) = p.parent() {
+                // 为其父路径添加p作为子路径
+                if let Some(v) = p
+                    .parent()
                     // 相对路径的顶级路径为 空 时，保留Key即可 可能为空 或 保留之前存在了子路径
-                    if !pp.to_string_lossy().is_empty() {
-                        path_subpaths.entry(pp).or_default().push(p);
-                    }
+                    .filter(|pp| !pp.to_string_lossy().is_empty())
+                    .and_then(|pp| {
+                        path_subpaths
+                            .entry(pp)
+                            .or_insert_with(|| Some(vec![]))
+                            .as_mut()
+                    })
+                {
+                    v.push(p)
                 }
                 path_subpaths
             },
         );
-        debug!("Generating all subpath digests for {} paths", paths.len());
         type DigestTy = Sha256;
         let subpath_digests = paths.iter().copied().fold(
             HashMap::<&Path, Option<[u8; 32]>>::new(),
@@ -377,14 +374,12 @@ impl<'p> MergePaths<'p> {
                 #[cfg(debug_assertions)]
                 trace!(
                     "Getting digest from {} next subpaths={:?} in current path {}",
-                    subpaths.len(),
+                    subpaths.as_deref().map_or(0, |s| s.len()),
                     subpaths,
                     path.display()
                 );
                 // 当前路径无子路径
-                let p_digest = if subpaths.is_empty() {
-                    None
-                } else {
+                let p_digest = if let Some(subpaths) = subpaths {
                     // 当前存在子路径
                     let p_digest: [u8; 32] = subpaths
                         .iter()
@@ -413,6 +408,8 @@ impl<'p> MergePaths<'p> {
                         .finalize()
                         .into();
                     Some(p_digest)
+                } else {
+                    None
                 };
                 subpath_digests.insert(path, p_digest);
                 subpath_digests
@@ -739,7 +736,6 @@ mod tests {
         }
     }
 
-    #[ignore = "实机测试环境可能不一致"]
     #[rstest]
     #[case(
         ["**/.git", "**/.cargo", "**/.vscode*"],
@@ -762,6 +758,7 @@ mod tests {
             "./perf.data.old",
         ]
     )]
+    #[ignore = "实机测试环境可能不一致"]
     fn test_integration_find_ignoreds_in_current_repo<'a>(
         #[case] excludes: impl IntoIterator<Item = &'a str>,
         #[case] exclude_ignoreds: impl IntoIterator<Item = &'a str>,
@@ -775,6 +772,7 @@ mod tests {
                 .then_with(|| a.cmp(b))
         }
         let mut ignoreds = find(["."], excludes, exclude_ignoreds).unwrap();
+        // let mut ignoreds = find(["."], excludes, exclude_ignoreds).unwrap();
         // ignoreds.sort_unstable_by_key(|p| (std::cmp::Reverse(p.ancestors().count()), p));
         ignoreds.sort_unstable_by(|a, b| path_sort_asc_fn(a, b));
         let expected = expected

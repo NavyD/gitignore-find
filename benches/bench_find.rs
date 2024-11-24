@@ -10,7 +10,7 @@ fn criterion_benchmark(c: &mut Criterion) {
         b.iter(|| {
             gitignore_find::find(
                 [&cwd],
-                [format!("{cwd}/.git/**"), format!("{cwd}/target/**")],
+                [format!("{cwd}/.git/**")],
                 ["**/.venv/bin/activate"],
             )
             .unwrap()
@@ -20,7 +20,7 @@ fn criterion_benchmark(c: &mut Criterion) {
 
 criterion_group! {
     name = benches;
-    config = Criterion::default().sample_size(10);
+    config = Criterion::default().sample_size(20);
     targets = criterion_benchmark
 }
 criterion_main!(benches);

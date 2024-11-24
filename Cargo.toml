@@ -18,7 +18,9 @@ jwalk = "0.8"
 log = "0.4"
 pyo3 = { version = "0.23", features = ["extension-module", "anyhow"] }
 sha2 = "0.10"
-smallvec = "1.13"
+hashbrown = { version = "0.15", features = ["rayon"] }
+mimalloc = "0.1"
+pyo3-log = "0.12"
 
 [dev-dependencies]
 env_logger = "0.11"
