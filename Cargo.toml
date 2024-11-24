@@ -6,7 +6,8 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
 name = "gitignore_find"
-crate-type = ["cdylib"]
+# rlib for benchmark: https://github.com/bheisler/criterion.rs/issues/301#issuecomment-1195512771
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 anyhow = "1.0"
@@ -16,9 +17,24 @@ itertools = "0.13"
 jwalk = "0.8"
 log = "0.4"
 pyo3 = { version = "0.23", features = ["extension-module", "anyhow"] }
+sha2 = "0.10"
+smallvec = "1.13"
 
 [dev-dependencies]
 env_logger = "0.11"
 ctor = "0.2"
-walkdir = "2.5"
 pretty_assertions = "1.4"
+rstest = "0.23"
+tempfile = "3.14"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# 使用命令`cargo bench`统计性能
+# https://github.com/bheisler/criterion.rs
+[[bench]]
+name = "bench_find"
+harness = false
+
+# 使用`cargo flamegraph --bench bench_find`生成火焰图
+# https://github.com/flamegraph-rs/flamegraph#usage-with-benchmarks
+[profile.bench]
+debug = true

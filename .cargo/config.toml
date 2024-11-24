@@ -1,0 +1,4 @@
+[env]
+# PYO3_PYTHON = "/first/absolut/to/.venv/bin/python"
+# pyo3 crate recompiled on (every?) build #1708: https://github.com/PyO3/pyo3/issues/1708
+PYO3_PYTHON = "/home/navyd/Workspaces/projects/gitignore-find/.venv/bin/python"

@@ -70,3 +70,9 @@ docs/_build/
 
 # Pyenv
 .python-version
+
+perf.data*
+flamegraph.svg
+
+# 忽略当前cargo配置
+.cargo/
