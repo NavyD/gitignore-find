@@ -29,6 +29,11 @@ pretty_assertions = "1.4"
 rstest = "0.23"
 tempfile = "3.14"
 criterion = { version = "0.5", features = ["html_reports"] }
+dhat = "0.3"
+clap = { version = "4.5", features = ["derive"] }
+
+[features]
+dhat-heap = []
 
 # 使用命令`cargo bench`统计性能
 # https://github.com/bheisler/criterion.rs
@@ -39,4 +44,8 @@ harness = false
 # 使用`cargo flamegraph --bench bench_find`生成火焰图
 # https://github.com/flamegraph-rs/flamegraph#usage-with-benchmarks
 [profile.bench]
+debug = true
+
+[profile.profiling]
+inherits = "release"
 debug = true

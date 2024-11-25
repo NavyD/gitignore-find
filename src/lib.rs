@@ -19,6 +19,7 @@ use pyo3::{
 };
 use sha2::{Digest, Sha256};
 
+#[cfg(not(feature = "dhat-heap"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

@@ -76,3 +76,8 @@ flamegraph.svg
 
 # 忽略当前cargo配置
 .cargo/
+
+# samply profiling分析缓存文件  https://github.com/mstange/samply/
+profile.json*
+# dhat内存分析文件 https://github.com/nnethercote/dhat-rs
+dhat-heap.json
