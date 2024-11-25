@@ -75,7 +75,7 @@ perf.data*
 flamegraph.svg
 
 # 忽略当前cargo配置
-.cargo/
+.cargo
 
 # samply profiling分析缓存文件  https://github.com/mstange/samply/
 profile.json*
