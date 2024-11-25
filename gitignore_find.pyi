@@ -4,7 +4,7 @@ import pathlib
 
 _PATH = str | os.PathLike[str] | pathlib.Path
 
-def gitignore_find(
+def find_ignoreds(
     paths: _PATH | Sequence[_PATH],
     excludes: Sequence[str] | None = None,
     exclude_ignoreds: Sequence[str] | None = None,
