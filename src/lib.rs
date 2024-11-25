@@ -12,6 +12,7 @@ use hashbrown::HashMap;
 use ignore::gitignore::Gitignore;
 use itertools::Itertools;
 use jwalk::{rayon::prelude::*, WalkDir};
+#[allow(unused_imports)]
 use log::{debug, log_enabled, trace, warn};
 use pyo3::{
     prelude::*,
@@ -94,7 +95,7 @@ pub fn find(
     .map(|p| Arc::try_unwrap(p).unwrap())
     .collect::<Vec<PathBuf>>();
 
-    trace!("Found {} ignored paths: {:?}", ignoreds.len(), ignoreds);
+    debug!("Found {} ignored paths for {:?}", ignoreds.len(), paths);
     Ok(ignoreds)
 }
 
