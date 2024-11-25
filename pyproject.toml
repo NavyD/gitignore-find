@@ -14,3 +14,11 @@ dynamic = ["version"]
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
+
+[tool.commitizen]
+version_provider = "cargo"
+update_changelog_on_bump = true
+version_scheme = "semver"
+tag_format = "v$version"
+# [Cargo.lock must be updated too for version #1201](https://github.com/commitizen-tools/commitizen/issues/1201)
+pre_bump_hooks = ["cargo c"]
