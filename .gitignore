@@ -81,3 +81,5 @@ flamegraph.svg
 profile.json*
 # dhat内存分析文件 https://github.com/nnethercote/dhat-rs
 dhat-heap.json
+
+.env
