@@ -16,11 +16,19 @@ ignore = "0.4"
 itertools = "0.13"
 jwalk = "0.8"
 log = "0.4"
-pyo3 = { version = "0.23", features = ["extension-module", "anyhow"] }
+pyo3 = { version = "0.23", features = [
+    "extension-module",
+    "anyhow",
+    # 要求python3.9及以上
+    "abi3-py39",
+] }
 sha2 = "0.10"
 hashbrown = { version = "0.15", features = ["rayon"] }
-mimalloc = "0.1"
 pyo3-log = "0.12"
+
+# 在gnu linux非x86平台可能会构建失败
+[target.'cfg(not(all(target_os = "linux", target_env = "gnu", not(any(target_arch = "x86_64", target_arch = "x86")))))'.dependencies]
+mimalloc = "0.1"
 
 [dev-dependencies]
 env_logger = "0.11"

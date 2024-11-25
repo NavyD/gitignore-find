@@ -20,7 +20,15 @@ use pyo3::{
 };
 use sha2::{Digest, Sha256};
 
-#[cfg(not(feature = "dhat-heap"))]
+#[cfg(all(
+    not(feature = "dhat-heap"),
+    // 在gnu linux非x86平台可能会构建失败
+    not(all(
+        target_os = "linux",
+        target_env = "gnu",
+        not(any(target_arch = "x86_64", target_arch = "x86"))
+    ))
+))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
