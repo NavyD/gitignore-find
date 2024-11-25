@@ -1,3 +1,9 @@
+## v0.3.1 (2024-11-26)
+
+### Fix
+
+- **ci**: Update from deprecated macos-12 to macos-13
+
 ## v0.3.0 (2024-11-26)
 
 ### Feat
