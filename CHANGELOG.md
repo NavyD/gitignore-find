@@ -1,3 +1,10 @@
+## v0.3.2 (2024-11-26)
+
+### Fix
+
+- python type stubs not work for find_ignoreds fn
+- Required py version from 3.8 to 3.9 in pyproject.toml
+
 ## v0.3.1 (2024-11-26)
 
 ### Fix
