@@ -1,10 +1,11 @@
 # https://github.com/xd009642/tarpaulin#config-file
 [test_config]
 engine = "Llvm"
-# follow-exec = true
+follow-exec = true
 skip-clean = true
 # [Cannot run cargo-tarpulin in a pyo3 project #1092](https://github.com/xd009642/tarpaulin/issues/1092#issuecomment-1407739176)
 no-dead-code = true
+# release = true
 
 [report]
 coveralls = "coveralls_key"

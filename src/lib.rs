@@ -39,6 +39,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 const PARALLEL_PATH_SIZE: usize = 50000;
 
 /// A Python module implemented in Rust.
+#[cfg(not(tarpaulin_include))]
 #[pymodule]
 fn gitignore_find(m: &Bound<'_, PyModule>) -> PyResult<()> {
     pyo3_log::Logger::new(m.py(), pyo3_log::Caching::LoggersAndLevels)?
@@ -51,6 +52,7 @@ fn gitignore_find(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
+#[cfg(not(tarpaulin_include))]
 #[pyfunction]
 #[pyo3(signature = (paths, excludes=None))]
 fn find_ignoreds(
@@ -70,6 +72,7 @@ fn find_ignoreds(
     find(paths, excludes)
 }
 
+#[cfg(not(tarpaulin_include))]
 pub fn find(
     paths: impl IntoIterator<Item: AsRef<Path> + Clone + Debug>,
     excludes: impl IntoIterator<Item: AsRef<str> + Clone + Debug>,
@@ -227,7 +230,7 @@ fn find_gitignoreds<'a>(
     let path = path.as_ref();
     let take_parent_path = |p: &&Path| *p != path;
 
-    debug!("Finding .gitignore files in {} path", path.display());
+    debug!("Finding .gitignore files in {}", path.display());
 
     let gitignores = find_all_paths_iter(path)
         .filter(|path| {
@@ -593,33 +596,34 @@ where
 
     #[cfg(debug_assertions)]
     trace!(
-        "Getting one tier subpaths in {} paths: {:?}",
+        "Getting one level subpaths in {} paths: {:?}",
         paths.len(),
         paths
     );
     // 保存路径对应的子路径  如果一个路径没有子路径则为空
-    let one_tier_subpaths = get_one_level_subpaths(paths.iter().map(|p| p.as_ref()));
+    let one_level_subpaths = get_one_level_subpaths(paths.iter().map(|p| p.as_ref()));
+    #[cfg(debug_assertions)]
+    trace!(
+        "Got one level subpaths {} paths: {:?}",
+        one_level_subpaths.len(),
+        one_level_subpaths
+    );
 
     type DigestTy = Sha256;
     let subpath_digests = paths.iter().fold(
         HashMap::<_, Option<PathDigestTy>>::new(),
         |mut subpath_digests, path| {
-            // SAFETY: paths的所有键都存在于one_tier_subpaths中
-            let subpaths = one_tier_subpaths
-                .get(path.as_ref().as_ref())
-                .unwrap_or_else(|| {
-                    panic!(
-                        "Not found subpaths for path {}",
-                        path.as_ref().as_ref().display()
-                    )
-                });
-            // let path = path.as_ref().as_ref();
+            let p = path.as_ref().as_ref();
+            let subpaths = one_level_subpaths
+                .get(p)
+                // SAFETY: paths的所有键都存在于one_tier_subpaths中
+                .unwrap_or_else(|| panic!("Not found subpaths for path {}", p.display()));
             #[cfg(debug_assertions)]
             trace!(
                 "Getting digest from {} next subpaths={:?} in current path {}",
                 subpaths.as_ref().map_or(0, |s| s.len()),
                 subpaths,
-                path.as_ref().as_ref().display()
+                p.display()
             );
             // 当前路径无子路径
             let p_digest = if let Some(subpaths) = subpaths {
@@ -632,7 +636,7 @@ where
                             panic!(
                                 "Not found digest for sub path {} of path {}",
                                 subp.as_ref().display(),
-                                path.as_ref().as_ref().display()
+                                p.display()
                             )
                         }) {
                             p_digest.chain_update(subp_digest)
@@ -657,7 +661,7 @@ where
         },
     );
 
-    drop(one_tier_subpaths);
+    drop(one_level_subpaths);
     drop(paths);
     subpath_digests
         .into_iter()
@@ -890,5 +894,33 @@ mod tests {
             .collect::<HashMap<_, _>>();
 
         assert_eq!(subpaths, expected);
+    }
+
+    #[rstest]
+    #[case([], [], true)]
+    #[case(["1.txt", ".env", ".venv/bin/test.sh"], [], false)]
+    #[case([], ["1.txt", ".env", ".venv/bin/test.sh"], false)]
+    #[case(
+        ["1.txt", ".env", ".venv", ".venv/bin", ".venv/bin/test.sh"],
+        [".venv/bin/test.sh", ".env", "1.txt", ".venv", ".venv/bin"],
+        true,
+    )]
+    #[case(
+        ["1.txt", ".env", ".envrc", ".venv", ".venv/bin", ".venv/bin/test.sh", ".venv/lib/a.pth", ".venv/pyvenv.cfg"],
+        ["1.txt", ".env", ".envrc", ".venv", ".venv/notbin", ".venv/notbin/test.sh", ".venv/lib/b.pth", ".venv/pyvenv.cfg"],
+        false,
+    )]
+    fn test_gen_all_subpath_digests<'a>(
+        #[case] paths: impl IntoIterator<Item = &'a str>,
+        #[case] other_paths: impl IntoIterator<Item = &'a str>,
+        #[case] expected: bool,
+    ) {
+        let subpath_digests = gen_all_subpath_digests(paths).collect::<HashMap<_, _>>();
+        let other_subpath_digests = gen_all_subpath_digests(other_paths).collect::<HashMap<_, _>>();
+        if expected {
+            assert_eq!(subpath_digests, other_subpath_digests);
+        } else {
+            assert_ne!(subpath_digests, other_subpath_digests);
+        }
     }
 }
