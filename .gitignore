@@ -83,3 +83,7 @@ profile.json*
 dhat-heap.json
 
 .env
+
+# coverage tool: cargo tarpaulin
+cobertura.xml
+tarpaulin-report.html
