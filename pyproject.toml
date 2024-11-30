@@ -11,9 +11,22 @@ classifiers = [
     "Programming Language :: Python :: Implementation :: PyPy",
 ]
 dynamic = ["version"]
+description = "Find all paths in the specified directory that are ignored by .gitignore files"
+readme = "README.md"
+license = { file = "LICENSE" }
+keywords = ["git", "gitignore", "ignore"]
+
+[[project.authors]]
+name = "navyd"
+
+[project.urls]
+Repository = "https://github.com/NavyD/gitignore-find"
+Changelog = "https://github.com/NavyD/gitignore-find/blob/main/CHANGELOG.md"
+
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
+
 
 [tool.commitizen]
 version_provider = "cargo"
