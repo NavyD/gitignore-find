@@ -1,3 +1,9 @@
+## v1.0.0 (2024-11-30)
+
+### Feat
+
+- Rewrite functions to improve performance
+
 ## v0.3.2 (2024-11-26)
 
 ### Fix
