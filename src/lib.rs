@@ -1,14 +1,13 @@
+use core::panic;
 use std::{
     fmt::Debug,
     hash::Hash,
-    ops::Deref,
     path::{Path, PathBuf},
-    sync::Arc,
+    rc::Rc,
 };
 
 use anyhow::{Error, Result};
 use globset::{GlobBuilder, GlobSetBuilder};
-use hashbrown::HashMap;
 use ignore::gitignore::Gitignore;
 use itertools::Itertools;
 use jwalk::{rayon::prelude::*, WalkDir};
@@ -19,6 +18,11 @@ use pyo3::{
     types::{PySequence, PyString},
 };
 use sha2::{Digest, Sha256};
+
+#[cfg(not(debug_assertions))]
+use hashbrown::{HashMap, HashSet};
+#[cfg(debug_assertions)]
+use std::collections::{HashMap, HashSet};
 
 #[cfg(all(
     not(feature = "dhat-heap"),
@@ -31,6 +35,8 @@ use sha2::{Digest, Sha256};
 ))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+const PARALLEL_PATH_SIZE: usize = 50000;
 
 /// A Python module implemented in Rust.
 #[pymodule]
@@ -46,11 +52,10 @@ fn gitignore_find(m: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (paths, excludes=None, exclude_ignoreds=None))]
+#[pyo3(signature = (paths, excludes=None))]
 fn find_ignoreds(
     paths: &Bound<'_, PyAny>,
     excludes: Option<&Bound<'_, PySequence>>,
-    exclude_ignoreds: Option<&Bound<'_, PySequence>>,
 ) -> Result<Vec<PathBuf>> {
     // paths支持str|sequence
     let paths = if let Ok(path) = paths.downcast::<PyString>() {
@@ -62,96 +67,61 @@ fn find_ignoreds(
     let excludes = excludes
         .map(|e| e.extract::<Vec<String>>())
         .unwrap_or_else(|| Ok(vec![]))?;
-    let exclude_ignoreds = exclude_ignoreds
-        .map(|e| e.extract::<Vec<String>>())
-        .unwrap_or_else(|| Ok(vec![]))?;
-    find(paths, excludes, exclude_ignoreds)
+    find(paths, excludes)
 }
 
 pub fn find(
     paths: impl IntoIterator<Item: AsRef<Path> + Clone + Debug>,
     excludes: impl IntoIterator<Item: AsRef<str> + Clone + Debug>,
-    exclude_ignoreds: impl IntoIterator<Item: AsRef<str> + Clone + Debug>,
 ) -> Result<Vec<PathBuf>> {
-    let (paths, excludes, exclude_ignoreds) = (
+    let (paths, excludes) = (
         paths.into_iter().collect_vec(),
         excludes.into_iter().collect_vec(),
-        exclude_ignoreds.into_iter().collect_vec(),
     );
     if log_enabled!(log::Level::Debug) {
         debug!(
-            "Finding git ignored paths with exclude globs \
-            {:?} and exclude ignored globs {:?} in {} paths: {:?}",
+            "Finding git ignored paths with exclude globs {:?} in {} paths: {:?}",
             excludes,
-            exclude_ignoreds,
             paths.len(),
             paths
         );
     }
-    let all_paths = find_all_paths(&paths, excludes)?;
-
-    debug!(
-        "Finding git ignored paths with exclude patterns {:?} in all {} paths",
-        exclude_ignoreds,
-        all_paths.len()
-    );
-    let ignoreds = find_gitignoreds(
-        all_paths.into_iter().map(Arc::new),
-        GlobPathPattern::new(exclude_ignoreds)?,
-    )
-    // SAFETY: only one ref
-    .map(|p| Arc::try_unwrap(p).unwrap())
-    .collect::<Vec<PathBuf>>();
+    let exclude_pat = GlobPathPattern::new(excludes)?;
+    let ignoreds = paths
+        .iter()
+        .map(|path| find_gitignoreds(path, &exclude_pat))
+        .collect::<Result<Vec<_>>>()
+        .map(|v| v.into_iter().flatten().collect_vec())?;
 
     debug!("Found {} ignored paths for {:?}", ignoreds.len(), paths);
     Ok(ignoreds)
 }
 
-/// 找到指定路径中的所有文件与目录
-fn find_all_paths<P, Q>(
-    paths: impl IntoIterator<Item = P>,
-    excludes: impl IntoIterator<Item = Q>,
-) -> Result<Vec<PathBuf>>
-where
-    P: AsRef<Path>,
-    Q: AsRef<str>,
-{
-    let exclude_pat = excludes
-        .into_iter()
-        .try_fold(GlobSetBuilder::new(), |mut gs, s| {
-            let glob = GlobBuilder::new(s.as_ref())
-                .literal_separator(true)
-                .build()?;
-            gs.add(glob);
-            Ok::<_, Error>(gs)
+fn find_all_paths_iter(path: impl AsRef<Path>) -> impl Iterator<Item = PathBuf> {
+    trace!("Traversing paths in directory {}", path.as_ref().display());
+    WalkDir::new(path)
+        .skip_hidden(false)
+        .process_read_dir(move |_depth, _path, _read_dir_state, children| {
+            children.retain(|dir_ent| {
+                dir_ent
+                    .as_ref()
+                    // 忽略.git目录
+                    .map(|ent| {
+                        ent.path().file_name().and_then(|s| s.to_str()) != Some(".git")
+                            || !ent.path().is_dir()
+                    })
+                    .unwrap_or(false)
+            });
         })
-        .and_then(|b| b.build().map_err(Into::into))?;
-
-    let exclude_pat = Arc::new(exclude_pat);
-    paths
         .into_iter()
-        .flat_map(|path| {
-            let exclude_pat = exclude_pat.clone();
-            let path = path.as_ref();
-            debug!("Traversing paths in directory {}", path.display());
-            WalkDir::new(path)
-                .sort(true)
-                .skip_hidden(false)
-                .process_read_dir(move |_depth, _path, _read_dir_state, children| {
-                    // let exclude_pat = exclude_pat.lock().unwrap();
-                    if !exclude_pat.is_empty() {
-                        children.retain(|dir_ent| {
-                            dir_ent
-                                .as_ref()
-                                .map(|ent| !exclude_pat.is_match(ent.path()))
-                                .unwrap_or(false)
-                        });
-                    }
-                })
-                .into_iter()
-                .map(|dir_ent| dir_ent.map(|e| e.path()).map_err(Into::into))
+        // .map(|dir_ent| dir_ent.map(|e| e.path()).map_err(Into::into))
+        .filter_map(move |p| match p {
+            Ok(p) => Some(p.path()),
+            Err(e) => {
+                warn!("Ignore to get path error: {}", e);
+                None
+            }
         })
-        .collect::<Result<Vec<PathBuf>>>()
 }
 
 trait PathPattern {
@@ -215,302 +185,488 @@ impl<T: AsRef<str>> TryFrom<&[T]> for GlobPathPattern {
     }
 }
 
-/// 对于paths中`.gitignore`存在的目录，返回所有被其忽略的文件和目录
+type PathDigestTy = [u8; 32];
+
+/// 对于path中所有的`.gitignore`，返回所有被其忽略的文件和目录。
 ///
-/// ## 移除
+/// ## 性能
 ///
-/// 不能先对paths进行移除，因为后续merge依赖paths路径的完整性，如果移除了paths部分路径文件，
-/// 会导致后续合并时认为目录仍然完整，从而合并了不应该合并的目录
+/// 由于现代OS都有文件缓存，短时间多次遍历目录速度较快，所以不需要保存扫描的目录路径，也
+/// 减少了大量内存使用
 ///
-/// 由于gi只匹配文件夹而不会对其中的文件匹配如`.venv`规则不会匹配`.venv/bin/test.sh`
-/// 会导致忽略的路径不包含子路径。一个简单的实现，在检查.gitignore时，
-/// 由于cur_ignoreds不包含子路径，在排除路径时需要获取所有路径，
+/// ## 合并目录
+///
+/// 由于[`Gitignore`]只匹配文件夹而不会对其中的文件匹配如`.venv`规则不会匹配`.venv/bin/test.sh`
+/// 会导致忽略的路径不包含子路径。
+///
+/// 一个简单的实现，在检查.gitignore时，由于cur_ignoreds不包含子路径，在排除路径时需要获取所有路径，
 /// 再从ignoreds中移除被排除的路径与父路径，这个路径会在后面被合并不会导致完整性问题，但存在性能问题，
 /// 一旦cur_ignoreds包含的所有路径稍大会消耗的时间指数级上升，不可取
-fn find_gitignoreds<I, T, P, E>(paths: I, exclude_pat: T) -> impl Iterator<Item = E>
-where
-    I: IntoIterator<Item = E>,
-    E: Deref<Target = P> + Clone + Debug + Send + Sync + Eq + Hash + Ord,
-    P: AsRef<Path>,
-    T: PathPattern + Send + Sync + Debug,
-{
-    let paths = paths.into_iter().collect::<Vec<_>>();
-    let merge_paths = MergePaths::new(paths.iter().map(|p| p.as_ref()));
+///
+/// ### 当前实现
+///
+/// 遍历获取所有gitignores文件，所有忽略ignoreds文件，由于[`Gitignore`]的特性，被忽略的目录不会存在子路径，
+/// 但由于需要排除路径，所有忽略的子目录都需要存在再用于排除，一旦被排除的路径存在ignoreds父路径中，则其所有父路径
+/// 都需要移除以避免后续合并时被作为存在父中的子路径被忽略了。
+///
+/// 在合并时检查：
+///
+/// 1. 当前路径p与.gitignore所在的目录 子路径一致 且 p的父路径不存在于ignoreds 时，表示这个路径p应该保留。
+///     当前路径p存在于ignored_subpaths但无subpaths时由于[`Gitignore`]特性表示所有子路径均被忽略
+/// 1. 当前路径中的任意父路径存在时，其父路径不被包含在gitignore所在目录中 或 包含的gitignore目录的子路径一致，
+///     表示这个路径可以忽略
+///
+/// 算法复杂度为O(N)最大为排序O(N log N)，使用由于并发获取路径还是会保存所有路径导致内存较大
+///
+/// 在比较子路径时如果数量较大时会导致内存和比较时消耗过大，可以使用hash排序生成digest比较，
+/// 但在ignoreds数量在10万级以下基本是负收益
+fn find_gitignoreds<'a>(
+    path: impl AsRef<Path>,
+    exclude_pat: &(impl PathPattern + Debug + 'a),
+) -> Result<impl Iterator<Item = PathBuf>> {
+    let path = path.as_ref();
+    let take_parent_path = |p: &&Path| *p != path;
 
-    debug!("Finding .gitignore files in {} paths", paths.len());
-    let gitignoreds = paths
-        .iter()
-        .map(|p| p.as_ref())
+    debug!("Finding .gitignore files in {} path", path.display());
+
+    let gitignores = find_all_paths_iter(path)
         .filter(|path| {
-            (exclude_pat.is_empty() || !exclude_pat.is_match(path))
-                && path.ends_with(".gitignore")
-                && path.is_file()
+            path.file_name().and_then(|s| s.to_str()) == Some(".gitignore") && path.is_file()
         })
         .map(|p| {
-            let (gi, err) = Gitignore::new(p);
+            let (gi, err) = Gitignore::new(&p);
             if let Some(e) = err {
                 warn!("Ignore load gitignore rule error in {}: {}", p.display(), e);
             }
-            gi
+            // NOTE: 不要使用gi.path()。如果是相对路径会导致`./a/.gitignore`变为`a`导致后续路径不一致
+            (
+                p.parent()
+                    .map(ToOwned::to_owned)
+                    // SAFETY: gitignore file always has parent path
+                    .unwrap_or_else(|| panic!("Not found parent of path {}", p.display())),
+                gi,
+            )
         })
-        .collect::<Vec<_>>();
-
+        .collect::<HashMap<_, _>>();
     #[cfg(debug_assertions)]
     trace!(
         "Found {} .gitignore files: {:?}",
-        gitignoreds.len(),
-        gitignoreds
+        gitignores.len(),
+        gitignores.keys().collect_vec(),
     );
 
     debug!(
-        "Finding ignored paths with {} gitignores and exclude pattern {:?} from all {} paths",
-        gitignoreds.len(),
+        "Finding ignored paths with {} gitignores and exclude pattern {:?} in {}",
+        gitignores.len(),
         exclude_pat,
-        paths.len()
+        path.display(),
     );
-    let ignoreds = paths
-        .par_iter()
+    let ignoreds = find_all_paths_iter(path)
+        // NOTE: 除非数据量上百万
+        // .par_bridge()
         .filter(|p| {
-            let p = p.as_ref();
-            (exclude_pat.is_empty() || !exclude_pat.is_match(p))
-                && gitignoreds.iter().any(|gi| {
-                    p.starts_with(gi.path())
-                        && (
-                            // gi只匹配文件夹而不会对其中的文件匹配如`.venv`规则不会匹配`.venv/bin/test.sh`会导致忽略的路径不包含子路径
-                            // 添加新条件以匹配子路径
-                            gi.matched(p, p.is_dir()).is_ignore()
-                                || p.ancestors()
-                                    .skip(1)
-                                    // 仅限制在gitignore目录内
-                                    .take_while(|pp| pp.starts_with(gi.path()))
-                                    // pp必然是dir
-                                    .any(|pp| gi.matched(pp, true).is_ignore())
-                        )
+            let keep = p
+                .ancestors()
+                .take_while_inclusive(take_parent_path)
+                // 仅使用首个gitignore文件匹配
+                .find_map(|pp| gitignores.get(pp))
+                .map(|gi| {
+                    // 提前检查当前路径是否为gitignore目录
+                    if gi.path() == p {
+                        // gi目录路径必为true
+                        gi.matched(p, true).is_ignore()
+                    } else {
+                        p.ancestors()
+                            // 不包含gitignore目录 避免其父路径可能由于`*`规则导致忽略
+                            .take_while(|newpp| *newpp != gi.path())
+                            .any(|newp| {
+                                // p的父路径必为目录true
+                                let v = gi.matched(newp, newp != p || newp.is_dir()).is_ignore();
+                                #[cfg(test)]
+                                if newp.ancestors().any(|p| p.ends_with("build")) {
+                                    print!("");
+                                }
+                                v
+                            })
+                    }
                 })
+                .unwrap_or(false);
+            #[cfg(test)]
+            print!("");
+            keep
         })
-        .cloned()
+        .map(Rc::new)
         .collect::<Vec<_>>();
     debug!(
-        "Mergeing {} ignored paths in {} paths",
+        "Found {} ignored paths for all paths {:?}{}",
         ignoreds.len(),
-        paths.len()
-    );
-    merge_paths.merge_rc_owned(ignoreds)
-}
-
-struct MergePaths<'a> {
-    all_subpath_digests: HashMap<&'a Path, Option<[u8; 32]>>,
-}
-
-impl<'p> MergePaths<'p> {
-    pub fn new<P>(paths: impl IntoIterator<Item = &'p P>) -> Self
-    where
-        P: AsRef<Path> + 'p + ?Sized + Ord + Sync + Send,
-    {
-        Self {
-            all_subpath_digests: Self::gen_subpath_digests(paths),
+        path,
+        if cfg!(all(debug_assertions, test)) {
+            format!(": {:?}", ignoreds.iter().map(|p| p.display()).collect_vec())
+        } else {
+            String::new()
         }
-    }
+    );
+    // 如果一个路径被排除则其所有存在的父路径应该被移除，避免后续被合并到父路径中
+    let ignoreds = if !exclude_pat.is_empty() {
+        trace!(
+            "Excluding {} paths using glob pattern: {:?}",
+            ignoreds.len(),
+            exclude_pat
+        );
+        let set = ignoreds
+            .iter()
+            // 升序先处理父路径后检查子路径时移除存在的父路径
+            .sorted_by_cached_key(|p| {
+                (
+                    // std::cmp::Reverse(p.ancestors().count()),
+                    p.ancestors().count(),
+                    p.file_name()
+                        .and_then(|s| s.to_str())
+                        .map(ToOwned::to_owned),
+                )
+            })
+            .fold(HashSet::new(), |mut set, p| {
+                let p = p.as_path();
+                if exclude_pat.is_match(p) {
+                    // 移除所有存在的父路径
+                    p.ancestors()
+                        .skip(1)
+                        .take_while_inclusive(take_parent_path)
+                        .for_each(|pp| {
+                            set.remove(pp);
+                        });
+                } else {
+                    set.insert(p);
+                }
+                set
+            });
+        let v = ignoreds
+            .iter()
+            .filter(|p| set.contains(p.as_path()))
+            .cloned()
+            .collect_vec();
+        drop(set);
+        drop(ignoreds);
+        v
+    } else {
+        ignoreds
+    };
 
-    /// 生成所有路径对应的 递归所有子路径 的digests。
-    ///
-    /// 如果一个路径没有子路径则`digest=None`
-    ///
-    /// ## 实现
-    ///
-    /// 排序后自低向上查找每个路径对应的子路径。对于每个路径，使用子路径的digest计算digest，
-    /// 不会真的检查递归的子路径，算法复杂度是O(N)
-    fn gen_subpath_digests<'a, P>(
-        paths: impl IntoIterator<Item = &'a P>,
-    ) -> HashMap<&'a Path, Option<[u8; 32]>>
-    where
-        P: AsRef<Path> + 'a + ?Sized,
-    {
-        fn path_sort_desc_key(p: &Path) -> impl Ord + Send + '_ {
+    // 用于检查父路径是否存在
+    let ignoreds_set = ignoreds.iter().map(|p| p.as_path()).collect::<HashSet<_>>();
+    // 用于检查子路径是否一致
+    let ignored_subpaths = {
+        trace!("Getting sub paths from {} ignoreds paths", ignoreds.len());
+        let subpaths = get_one_level_subpaths(ignoreds.iter().map(|p| p.as_path()));
+
+        #[cfg(debug_assertions)]
+        type MapTy = HashSet<PathBuf>;
+        #[cfg(not(debug_assertions))]
+        type MapTy = PathDigestTy;
+        fn to_digest<'a>(
+            (p, paths): (&'a Path, Option<HashSet<&'a Path>>),
+        ) -> (&'a Path, Option<MapTy>) {
             (
-                std::cmp::Reverse(p.ancestors().count()),
-                p.file_name().and_then(|s| s.to_str()),
+                p,
+                #[cfg(debug_assertions)]
+                paths.map(|paths| {
+                    paths
+                        .into_iter()
+                        .map(ToOwned::to_owned)
+                        .collect::<HashSet<_>>()
+                }),
+                #[cfg(not(debug_assertions))]
+                paths.map(gen_digest),
             )
         }
 
-        let paths = {
-            let mut v = paths.into_iter().map(|p| p.as_ref()).collect_vec();
-            // 加速合并
-            if v.len() > 100000 {
-                v.par_sort_by_cached_key(|p| path_sort_desc_key(p));
-            } else {
-                v.sort_by_cached_key(|p| path_sort_desc_key(p));
+        if subpaths.len() < PARALLEL_PATH_SIZE {
+            subpaths
+                .into_iter()
+                .map(to_digest)
+                .collect::<HashMap<_, _>>()
+        } else {
+            subpaths
+                .into_par_iter()
+                .map(to_digest)
+                .collect::<HashMap<_, _>>()
+        }
+    };
+    trace!(
+        "Traversing all sub paths of {} .gitignore paths{}",
+        gitignores.len(),
+        if cfg!(all(debug_assertions, test)) {
+            format!(
+                ": {:?}",
+                gitignores
+                    .keys()
+                    .map(|p| p.display().to_string())
+                    .collect_vec()
+            )
+        } else {
+            String::new()
+        }
+    );
+    // 获取gitignore目录对应的一层实际子路径  用于与ignoreds子路径对比是否一致
+    let gitignore_subpaths = gitignores
+        .keys()
+        .par_bridge()
+        // .par_keys()
+        .map(|p| {
+            let p = p.as_path();
+            // NOTE: 当ignored_subpaths的paths=None时表示这个p对应子路径不存在
+            // 或所有路径均被忽略了  保存一致方便比较
+            if ignored_subpaths
+                .get(p)
+                .map_or(false, |paths| paths.is_none())
+            {
+                return Ok((p, None));
             }
-            v
-        };
+            let paths = std::fs::read_dir(p)?
+                .map_ok(|p| p.path())
+                .collect::<Result<HashSet<_>, _>>()?;
+            #[cfg(debug_assertions)]
+            let v = paths;
+            #[cfg(not(debug_assertions))]
+            let v = gen_digest(paths);
+            Ok::<_, Error>((p, Some(v)))
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
 
-        #[cfg(debug_assertions)]
-        trace!(
-            "Getting one tier subpaths in {} paths: {:?}",
-            paths.len(),
-            paths
-        );
-        // 保存路径对应的子路径  如果一个路径没有子路径则为空
-        let one_tier_subpaths = paths.iter().copied().fold(
-            HashMap::new(),
-            |mut path_subpaths: HashMap<&Path, Option<Vec<&Path>>>, p| {
-                // 为所有路径默认添加子路径为None
-                path_subpaths.entry(p).or_default();
-                // 为其父路径添加p作为子路径
-                if let Some(v) = p
-                    .parent()
-                    // 相对路径的顶级路径为 空 时，保留Key即可 可能为空 或 保留之前存在了子路径
-                    .filter(|pp| !pp.to_string_lossy().is_empty())
-                    .and_then(|pp| {
-                        path_subpaths
-                            .entry(pp)
-                            .or_insert_with(|| Some(vec![]))
-                            .as_mut()
-                    })
-                {
-                    v.push(p)
-                }
-                path_subpaths
-            },
-        );
-        type DigestTy = Sha256;
-        let subpath_digests = paths.iter().copied().fold(
-            HashMap::<&Path, Option<[u8; 32]>>::new(),
-            |mut subpath_digests, path| {
-                // SAFETY: paths的所有键都存在于one_tier_subpaths中
-                let subpaths = one_tier_subpaths
-                    .get(path)
-                    .unwrap_or_else(|| panic!("Not found subpaths for path {}", path.display()));
-                #[cfg(debug_assertions)]
-                trace!(
-                    "Getting digest from {} next subpaths={:?} in current path {}",
-                    subpaths.as_deref().map_or(0, |s| s.len()),
-                    subpaths,
-                    path.display()
-                );
-                // 当前路径无子路径
-                let p_digest = if let Some(subpaths) = subpaths {
-                    // 当前存在子路径
-                    let p_digest: [u8; 32] = subpaths
-                        .iter()
-                        .fold(DigestTy::new(), |p_digest, subp| {
-                            // SAFETY: 降序保证了子路径先于父路径计算digest，所以当前路径的子路径一定是计算过的 或 无子路径
-                            if let Some(subp_digest) =
-                                subpath_digests.get(subp).unwrap_or_else(|| {
-                                    panic!(
-                                        "Not found digest for sub path {} of path {}",
-                                        subp.display(),
-                                        path.display()
-                                    )
-                                })
-                            {
-                                p_digest.chain_update(subp_digest)
-                            } else {
-                                // 当前路径不存在子路径digest时如 `/a/b/1.txt`中的b子路径`1.txt`无子路径即不会
-                                // 有digest，在计算到b路径的subpaths时为空，此时使用1.txt路径计算
-                                let d: [u8; 32] = DigestTy::new()
-                                    .chain_update(subp.display().to_string())
-                                    .finalize()
-                                    .into();
-                                p_digest.chain_update(d)
+    debug!("Merging {} ignored paths", ignoreds.len());
+    let mergeds = ignoreds
+        .iter()
+        .filter(|p| {
+            let p = p.as_path();
+            let mut ances = p.ancestors().skip(1).take_while_inclusive(take_parent_path);
+            #[cfg(all(debug_assertions, test))]
+            if p.ancestors().any(|pp| pp.ends_with("build")) {
+                print!("")
+            }
+            // 被忽略的当前路径是 `.gitginore`文件所在的目录
+            // 如.gitignore文件内容是`*``!xxx/`时其目录会被忽略但内还有目录未被忽略
+            let keep = if let Some(p_gitignore_subpaths) = gitignore_subpaths.get(p) {
+                // 仅当.gitignore所在的目录 子路径一致 且 其父路径不存在 时保留
+                // NOTE: 当p存在于ignored_subpaths但无subpaths时表示所有子路径均被忽略
+                // 这是由于gitignore.is_match()匹配行为导致的：对于指定gitignore规则如`.venv`不会匹配`.venv/bin`
+                Some(p_gitignore_subpaths) == ignored_subpaths.get(p)
+                    && ances.all(|pp| !ignoreds_set.contains(pp))
+            } else {
+                // 当前路径中的任意父路径 存在 且 其父路径不被包含在gitignore所在目录中
+                // 或 包含的gitignore目录的子路径一致，表示这个路径可以忽略
+                !ances.any(|pp| {
+                    ignoreds_set.contains(pp)
+                        && gitignore_subpaths
+                            .get(pp)
+                            // is_none || ==
+                            .map_or(true, |pp_gitignore_subpaths| {
+                                Some(pp_gitignore_subpaths) == ignored_subpaths.get(pp)
+                            })
+                })
+            };
+            #[cfg(all(debug_assertions, test))]
+            trace!(
+                "Path {} is keep={} with p_gitignore_subpaths={:?} p_ignored_subpaths={:?}",
+                p.display(),
+                keep,
+                gitignore_subpaths.get(p),
+                ignored_subpaths.get(p)
+            );
+            keep
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    drop(ignoreds_set);
+    drop(ignored_subpaths);
+    drop(gitignore_subpaths);
+    drop(ignoreds);
+    // SAFETY: All references have been dropped
+    Ok(mergeds.into_iter().map(|p| Rc::try_unwrap(p).unwrap()))
+}
+
+#[allow(dead_code)]
+fn gen_digest(paths: impl IntoIterator<Item: AsRef<Path> + Ord>) -> PathDigestTy {
+    paths
+        .into_iter()
+        .sorted_unstable()
+        .fold(Sha256::new(), |d, p| {
+            d.chain_update(p.as_ref().display().to_string())
+        })
+        .finalize()
+        .into()
+}
+
+/// 获取所有路径分别对应的一层子路径paths。
+///
+/// # 实现
+///
+/// 通过一次遍历对当前路径的父路径添加当前路径
+fn get_one_level_subpaths<'a, P>(
+    paths: impl IntoIterator<Item = &'a P>,
+) -> HashMap<&'a Path, Option<HashSet<&'a P>>>
+where
+    P: AsRef<Path> + Hash + Eq + 'a + ?Sized,
+{
+    paths.into_iter().fold(
+        HashMap::<&Path, Option<HashSet<_>>>::new(),
+        |mut path_subpaths, p| {
+            // 为所有路径默认添加子路径为None
+            let _subpaths = path_subpaths.entry(p.as_ref()).or_default();
+            #[cfg(all(debug_assertions, test))]
+            trace!(
+                "Getting {} subpaths of {}: {:?}",
+                _subpaths.as_ref().map_or(0, |v| v.len()),
+                p.as_ref().display(),
+                _subpaths.as_ref().map(|v| v
+                    .iter()
+                    .map(|p| p.as_ref().display().to_string())
+                    .collect_vec()),
+            );
+            // 为其父路径添加p作为子路径
+            if let Some((_pp, subpaths)) = p
+                .as_ref()
+                .parent()
+                // 相对路径的顶级路径为 空 时，保留Key即可 可能为空 或 保留之前存在了子路径
+                .filter(|pp| !pp.to_string_lossy().is_empty())
+                .and_then(|pp| {
+                    path_subpaths
+                        .entry(pp)
+                        // NOTE: 之前插入了None如果此时不修改会导致key已存在一直为None
+                        .and_modify(|v| {
+                            if v.is_none() {
+                                *v = Some(HashSet::new())
                             }
                         })
-                        .finalize()
-                        .into();
-                    Some(p_digest)
-                } else {
-                    None
-                };
-                subpath_digests.insert(path, p_digest);
-                subpath_digests
-            },
-        );
-        subpath_digests
-    }
+                        .or_insert_with(|| Some(HashSet::new()))
+                        .as_mut()
+                        .map(|v| (pp, v))
+                })
+            {
+                #[cfg(all(debug_assertions, test))]
+                trace!(
+                    "Adding {} to {}'s {} subpaths: {:?}",
+                    p.as_ref().display(),
+                    _pp.display().to_string(),
+                    subpaths.len(),
+                    subpaths
+                        .iter()
+                        .map(|p| p.as_ref().display().to_string())
+                        .collect_vec()
+                );
+                subpaths.insert(p);
+            }
+            path_subpaths
+        },
+    )
+}
 
-    #[allow(dead_code)]
-    pub fn merge<'b, P>(
-        &self,
-        paths: impl IntoIterator<Item = &'b P>,
-        // ) -> Vec<&'b P>
-    ) -> impl Iterator<Item = &'b P>
-    where
-        P: AsRef<Path> + Debug + 'b + ?Sized + Sync + Send + Ord + Hash,
-    {
-        self.merge_rc_owned(paths.into_iter().map(Arc::new))
-            // SAFETY: p only one ref
-            .map(|p| Arc::try_unwrap(p).unwrap())
-        // todo!()
-    }
+/// 生成所有路径对应的 递归所有子路径 的digests。
+///
+/// 如果一个路径没有子路径则`digest=None`
+///
+/// ## 实现
+///
+/// 排序后自低向上查找每个路径对应的子路径。对于每个路径，使用子路径的digest计算digest，
+/// 不会真的检查递归的子路径，算法复杂度是O(N)
+#[allow(dead_code)]
+fn gen_all_subpath_digests<P>(
+    paths: impl IntoIterator<Item = P>,
+) -> impl Iterator<Item = (P, Option<PathDigestTy>)>
+where
+    P: AsRef<Path> + Ord + Hash + Eq + Debug,
+{
+    let paths = {
+        let mut v = paths.into_iter().map(Rc::new).collect_vec();
+        v.sort_by_cached_key(|p| {
+            let p = p.as_ref().as_ref();
+            (
+                std::cmp::Reverse(p.ancestors().count()),
+                p.file_name()
+                    .and_then(|s| s.to_str())
+                    .map(ToOwned::to_owned),
+            )
+        });
+        v
+    };
 
-    /// 检查当前的paths与自身的差异后合并所有可能的路径并返回。
-    ///
-    /// 通过比较当前路径是否被包含在其父路径中 且 其所有子路径都存在于整体中时，
-    /// 将合并这个路径
-    pub fn merge_rc_owned<I, E, P>(&self, paths: I) -> impl Iterator<Item = E>
-    where
-        I: IntoIterator<Item = E>,
-        E: Deref<Target = P> + Debug + Clone + Sync + Send + Ord + Hash,
-        P: AsRef<Path>,
-    {
-        let paths = paths.into_iter().collect::<Vec<_>>();
-        debug!("Generating subpath digests for {} paths", paths.len());
-        let cur_subpath_digests = Self::gen_subpath_digests(paths.iter().map(|p| p.as_ref()));
-
-        debug!(
-            "Merging {} paths for all {} paths",
-            paths.len(),
-            self.all_subpath_digests.len(),
-        );
+    #[cfg(debug_assertions)]
+    trace!(
+        "Getting one tier subpaths in {} paths: {:?}",
+        paths.len(),
         paths
-            .par_iter()
-            .filter(|&p| {
-                let p = p.as_ref();
-                // SAFETY: p always in cur_subpaths
-                let p_subpath_digest = cur_subpath_digests
-                    .get(p)
-                    .unwrap_or_else(|| panic!("Not found digest for current path {}", p.display()));
+    );
+    // 保存路径对应的子路径  如果一个路径没有子路径则为空
+    let one_tier_subpaths = get_one_level_subpaths(paths.iter().map(|p| p.as_ref()));
 
-                let mut p_ancestors = p
-                    .ancestors()
-                    // 排除第1个 self
-                    .skip(1)
-                    // 排除`Path::new("a/b")`时最后一个为空
-                    .filter(|pp| !pp.as_os_str().is_empty())
-                    .peekable();
+    type DigestTy = Sha256;
+    let subpath_digests = paths.iter().fold(
+        HashMap::<_, Option<PathDigestTy>>::new(),
+        |mut subpath_digests, path| {
+            // SAFETY: paths的所有键都存在于one_tier_subpaths中
+            let subpaths = one_tier_subpaths
+                .get(path.as_ref().as_ref())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Not found subpaths for path {}",
+                        path.as_ref().as_ref().display()
+                    )
+                });
+            // let path = path.as_ref().as_ref();
+            #[cfg(debug_assertions)]
+            trace!(
+                "Getting digest from {} next subpaths={:?} in current path {}",
+                subpaths.as_ref().map_or(0, |s| s.len()),
+                subpaths,
+                path.as_ref().as_ref().display()
+            );
+            // 当前路径无子路径
+            let p_digest = if let Some(subpaths) = subpaths {
+                // 当前存在子路径
+                let p_digest: PathDigestTy = subpaths
+                    .iter()
+                    .fold(DigestTy::new(), |p_digest, subp| {
+                        // SAFETY: 降序保证了子路径先于父路径计算digest，所以当前路径的子路径一定是计算过的 或 无子路径
+                        if let Some(subp_digest) = subpath_digests.get(*subp).unwrap_or_else(|| {
+                            panic!(
+                                "Not found digest for sub path {} of path {}",
+                                subp.as_ref().display(),
+                                path.as_ref().as_ref().display()
+                            )
+                        }) {
+                            p_digest.chain_update(subp_digest)
+                        } else {
+                            // 当前路径不存在子路径digest时如 `/a/b/1.txt`中的b子路径`1.txt`无子路径即不会
+                            // 有digest，在计算到b路径的subpaths时为空，此时使用1.txt路径计算
+                            let d: PathDigestTy = DigestTy::new()
+                                .chain_update(subp.as_ref().display().to_string())
+                                .finalize()
+                                .into();
+                            p_digest.chain_update(d)
+                        }
+                    })
+                    .finalize()
+                    .into();
+                Some(p_digest)
+            } else {
+                None
+            };
+            subpath_digests.insert(path.clone(), p_digest);
+            subpath_digests
+        },
+    );
 
-                // 这个p是顶级路径如相对路径`a`或绝对路径`/`
-                let keep = if p_ancestors.peek().is_none() {
-                    // 当前路径 无子路径
-                    // 或 子路径全部都存在于整体中时 保留这个路径
-                    // 表示是需要合并的路径 返回 true
-                    p_subpath_digest.is_none()
-                        || self.all_subpath_digests.get(p) == Some(p_subpath_digest)
-                } else {
-                    // 当前路径 不存在子路径 或 所有子路径与整体一致，
-                    // 且 当前路径的任意一个父路径 已存在 且 这个父路径所有的子路径都在整体中，
-                    // 那么表示可合并 这个路径即可忽略 返回false
-                    (p_subpath_digest.is_none()
-                        || self.all_subpath_digests.get(p) == Some(p_subpath_digest))
-                        && !p_ancestors.any(|pp| {
-                            cur_subpath_digests.contains_key(pp)
-                                && cur_subpath_digests.get(pp) == self.all_subpath_digests.get(pp)
-                        })
-                };
-
-                #[cfg(debug_assertions)]
-                trace!("Path {} is keep={}", p.display(), keep);
-                keep
-            })
-            .cloned()
-            .collect::<Vec<_>>()
-            .into_iter()
-    }
+    drop(one_tier_subpaths);
+    drop(paths);
+    subpath_digests
+        .into_iter()
+        .map(|(k, v)| (Rc::try_unwrap(k).unwrap(), v))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Once;
+    use std::{borrow::Borrow, sync::Once};
 
     use super::*;
     use log::LevelFilter;
@@ -531,29 +687,42 @@ mod tests {
     }
 
     /// 从repo_dir中创建相关文件与.gitignore文件，返回repo_dir所有文件与目录
-    fn mock_git_paths<P, Q>(
-        gitignore_items: impl IntoIterator<Item = P>,
+    fn mock_git_paths<IP, II, IIP, Q>(
+        gitignore_items: impl IntoIterator<Item = (IP, II)>,
         paths: impl IntoIterator<Item = Q>,
         repo_dir: impl AsRef<Path>,
     ) -> impl Iterator<Item = PathBuf>
     where
-        P: AsRef<Path>,
         Q: AsRef<Path>,
+        IP: AsRef<Path>,
+        II: Borrow<[IIP]>,
+        IIP: AsRef<Path>,
     {
         let repo_dir = repo_dir.as_ref();
 
         // write .gitignore file
         let gitignore_items = gitignore_items.into_iter().collect_vec();
         if !gitignore_items.is_empty() {
-            let gitignore_path = repo_dir.join(".gitignore");
-            std::fs::write(
-                &gitignore_path,
-                gitignore_items
-                    .iter()
-                    .map(|i| i.as_ref().display())
-                    .join("\n"),
-            )
-            .unwrap();
+            for (path, items) in gitignore_items {
+                let gitignore_path = repo_dir.join(path);
+                if let Some(p) = gitignore_path.parent() {
+                    std::fs::create_dir_all(p).unwrap();
+                }
+                assert!(
+                    gitignore_path.ends_with(".gitignore"),
+                    "not found .gitignore suffix for {}",
+                    gitignore_path.display()
+                );
+                std::fs::write(
+                    &gitignore_path,
+                    items
+                        .borrow()
+                        .iter()
+                        .map(|i| i.as_ref().display())
+                        .join("\n"),
+                )
+                .unwrap();
+            }
         }
 
         // write other files
@@ -583,57 +752,43 @@ mod tests {
     }
 
     #[rstest]
-    #[test]
-    #[case::all_empty([], [], [])]
-    #[case::no_excludes(["1.txt", ".env", ".envrc"], [], ["1.txt", ".env", ".envrc"])]
-    #[case::excludes(["1.txt", ".env", ".envrc"], ["**/.env*"], ["1.txt"])]
-    fn test_find_paths<'a>(
-        #[case] paths: impl IntoIterator<Item = &'a str>,
-        #[case] excludes: impl IntoIterator<Item = &'a str>,
-        #[case] expected: impl IntoIterator<Item = &'a str>,
-    ) -> Result<()> {
-        let tmpdir = tempfile::tempdir().unwrap();
-        let paths = paths.into_iter().collect_vec();
-        // NOTE: tmpdir非引用会导致提前移除目录
-        let _git_paths = mock_git_paths([] as [&str; 0], &paths, &tmpdir).collect_vec();
-
-        let mut all_paths = find_all_paths([&tmpdir], excludes)?;
-        // 包含根目录tmpdir
-        assert!(all_paths.contains(&tmpdir.path().to_path_buf()));
-        all_paths.retain(|p| p.as_path() != tmpdir.path());
-        all_paths.sort();
-
-        let expected: Vec<_> = expected
-            .into_iter()
-            .map(|s| tmpdir.path().join(s))
-            .sorted()
-            .collect();
-        assert_eq!(all_paths, expected);
-        Ok(())
-    }
-
-    #[rstest]
     #[case::all_empty([], [], [], [])]
     #[case::no_gitignore_and_no_excludes(["1.txt", ".env", ".envrc"], [], [], [])]
-    #[case::no_excludes(["1.txt", ".env", ".envrc"], [".env*"], [], [".env", ".envrc"])]
+    #[case::no_excludes(["1.txt", ".env", ".envrc"], [(".gitignore", &[".env*"] as &[&str])], [], [".env", ".envrc"])]
     #[case::no_gitignore(["1.txt", ".env", ".envrc"], [], ["**/.env"], [])]
-    #[case::exclude_env(["1.txt", ".env", ".envrc"], [".env*"], ["**/.env"], [".envrc"])]
-    #[case::nest_excludes(["1.txt", ".env", ".envrc", ".venv/bin/test.sh", ".venv/lib/a.pth"], [".env*", ".venv"], ["**/.env", "**/.venv/**", "**/.venv"], [".envrc"])]
+    #[case::exclude_env(
+        ["1.txt", ".env", ".envrc"],
+        [(".gitignore", &[".env*"] as &[&str])],
+        ["**/.env"],
+        [".envrc"]
+    )]
+    #[case::nest_excludes(
+        ["1.txt", ".env", ".envrc", ".venv/bin/test.sh", ".venv/lib/a.pth"],
+        [(".gitignore", &[".env*", ".venv"]as &[&str])],
+        ["**/.env", "**/.venv/**", "**/.venv"],
+        [".envrc"]
+    )]
     #[case::nest_excludes(
         ["1.txt", ".env", ".envrc", ".venv/bin/test.sh", ".venv/lib/a.pth", ".venv/pyvenv.cfg"],
-        [".env*", ".venv"],
+        [(".gitignore", &[".env*", ".venv"] as &[&str])],
         ["**/.env", "**/.venv/bin", "**/.venv/bin/**"],
         [".envrc", ".venv/lib", ".venv/pyvenv.cfg"],
     )]
     #[case::nest_excludes_without_globself(
         ["1.txt", ".env", ".envrc", ".venv/bin/test.sh", ".venv/lib/a.pth", ".venv/pyvenv.cfg"],
-        [".env*", ".venv"],
+        [(".gitignore", &[".env*", ".venv"] as &[&str])],
         ["**/.env", "**/.venv/bin/**"],
-        [".envrc", ".venv/bin", ".venv/lib", ".venv/pyvenv.cfg"],
+        [".envrc", ".venv/lib", ".venv/pyvenv.cfg"],
+    )]
+    #[case::nest_gitignores(
+        ["1.txt", ".env", ".envrc", ".venv/bin/test.sh", ".venv/lib/a.pth", ".venv/pyvenv.cfg", "build/a.txt", "build/1.txt"],
+        [(".gitignore", &[".env*", ".venv"] as &[&str]), ("build/.gitignore", &["*", "!a.txt"])],
+        ["**/.env", "**/.venv/bin/**"],
+        [".envrc", ".venv/lib", ".venv/pyvenv.cfg", "build/1.txt", "build/.gitignore"],
     )]
     fn test_find_gitignoreds<'a>(
         #[case] paths: impl IntoIterator<Item = &'a str>,
-        #[case] gitignore_items: impl IntoIterator<Item = &'a str>,
+        #[case] gitignore_items: impl IntoIterator<Item = (&'a str, &'a [&'a str])>,
         #[case] excludes: impl IntoIterator<Item = &'a str>,
         #[case] expected: impl IntoIterator<Item = &'a str>,
     ) -> Result<()> {
@@ -644,13 +799,9 @@ mod tests {
         for p in &git_paths {
             assert!(p.exists(), "path {} is not exists", p.display());
         }
-        let ignoreds = find_gitignoreds(
-            git_paths.into_iter().map(Arc::new),
-            GlobPathPattern::new(excludes)?,
-        )
-        .sorted()
-        .map(|p| Arc::try_unwrap(p).unwrap())
-        .collect::<Vec<PathBuf>>();
+        let ignoreds = find_gitignoreds(&tmpdir, &GlobPathPattern::new(excludes)?)?
+            .sorted_unstable()
+            .collect_vec();
         let expected = expected
             .into_iter()
             .map(|s| tmpdir.path().join(s))
@@ -660,96 +811,11 @@ mod tests {
         Ok(())
     }
 
-    static MERGE_ALL_PATHS: &[&str] = &[
-        "a",
-        "a/1.txt",
-        "b",
-        "b/.env",
-        "b/.envrc",
-        "c",
-        // relative paths
-        ".venv",
-        ".venv/pyvenv.cfg",
-        ".venv/bin",
-        ".venv/bin/test.sh",
-        ".venv/bin/activate",
-        ".venv/lib",
-        ".venv/lib/a.pth",
-        // absolute venv paths
-        "/tmp/rs/.venv",
-        "/tmp/rs/.venv/pyvenv.cfg",
-        "/tmp/rs/.venv/bin",
-        "/tmp/rs/.venv/bin/test.sh",
-        "/tmp/rs/.venv/bin/activate",
-        "/tmp/rs/.venv/lib",
-        "/tmp/rs/.venv/lib/a.pth",
-    ];
-
-    #[rstest]
-    #[case(MERGE_ALL_PATHS, ["b", "b/.env", "b/.envrc"], ["b"])]
-    #[case(MERGE_ALL_PATHS, ["b", "b/.envrc"], ["b/.envrc"])]
-    #[case(MERGE_ALL_PATHS, ["c"], ["c"])]
-    #[case(
-        MERGE_ALL_PATHS,
-        ["b", "b/.env", "c", ".venv/bin/test.sh", ".venv/pyvenv.cfg", ".venv/lib", ".venv/lib/a.pth",],
-        ["b/.env", "c", ".venv/lib", ".venv/bin/test.sh", ".venv/pyvenv.cfg"]
-    )]
-    #[case(
-        MERGE_ALL_PATHS,
-        [".venv", ".envrc", ".venv/pyvenv.cfg", ".venv/lib", ".venv/lib/a.pth"],
-        [".envrc", ".venv/lib", ".venv/pyvenv.cfg"],
-    )]
-    #[case(
-        MERGE_ALL_PATHS,
-        ["/tmp/rs/.venv", "/tmp/rs/.envrc", "/tmp/rs/.venv/pyvenv.cfg", "/tmp/rs/.venv/lib", "/tmp/rs/.venv/lib/a.pth"],
-        ["/tmp/rs/.envrc", "/tmp/rs/.venv/lib", "/tmp/rs/.venv/pyvenv.cfg"],
-    )]
-    fn test_merge_paths<'a>(
-        #[case] all_paths: impl IntoIterator<Item = &'a (impl AsRef<Path> + 'a + Ord + Send + Sync)>,
-        #[case] paths: impl IntoIterator<Item = &'a str>,
-        #[case] expected: impl IntoIterator<Item = &'a str>,
-        // #[case] paths: impl IntoIterator<Item = &'a (impl AsRef<Path> + 'a + Debug + Ord)>,
-        // #[case] expected: impl IntoIterator<Item = &'a (impl AsRef<Path> + 'a + Ord)>,
-    ) -> Result<()> {
-        let paths = paths.into_iter().collect_vec();
-        let all_paths = all_paths.into_iter().collect_vec();
-        let mergeds = MergePaths::new(all_paths)
-            .merge(paths)
-            .sorted()
-            .collect::<Vec<_>>();
-        let expected = expected.into_iter().sorted().collect_vec();
-        assert_eq!(mergeds, expected);
-        Ok(())
-    }
-
-    #[rstest]
-    #[case([], [], true)]
-    #[case(["1.txt", ".env", ".venv/bin/test.sh"], [], false)]
-    #[case([], ["1.txt", ".env", ".venv/bin/test.sh"], false)]
-    #[case(["1.txt", ".env", ".venv/bin/test.sh"], [".venv/bin/test.sh", ".env", "1.txt"], true)]
-    #[case(
-        ["1.txt", ".env", ".envrc", ".venv/bin/test.sh", ".venv/lib/a.pth", ".venv/pyvenv.cfg"],
-        ["1.txt", ".env", ".envrc", ".venv/notbin/test.sh", ".venv/lib/b.pth", ".venv/pyvenv.cfg"],
-        false,
-    )]
-    fn test_gen_subpath_digests<'a>(
-        #[case] paths: impl IntoIterator<Item = &'a str>,
-        #[case] other_paths: impl IntoIterator<Item = &'a str>,
-        #[case] expected: bool,
-    ) {
-        let subpath_digests = MergePaths::gen_subpath_digests(paths);
-        let other_subpath_digests = MergePaths::gen_subpath_digests(other_paths);
-        if expected {
-            assert_eq!(subpath_digests, other_subpath_digests);
-        } else {
-            assert_ne!(subpath_digests, other_subpath_digests);
-        }
-    }
-
     #[rstest]
     #[case(
-        ["**/.git", "**/.cargo", "**/.vscode*"],
-        [] as [&str; 0],
+        ["/home/navyd/.local/share/chezmoi"],
+        // ["**/.git/**", "**/.venv/**", "**/target/**"],
+        ["**/.git/**", "**/.venv/**", "**/target/**", "**/*cache/**"],
         [
             "./.venv",
             "./flamegraph.svg",
@@ -759,8 +825,8 @@ mod tests {
         ]
     )]
     #[case(
+        ["."],
         ["**/.git", "**/.cargo", "**/.vscode*"],
-        ["**/target", "**/target/**"],
         [
             "./.venv",
             "./flamegraph.svg",
@@ -770,8 +836,8 @@ mod tests {
     )]
     #[ignore = "实机测试环境可能不一致"]
     fn test_integration_find_ignoreds_in_current_repo<'a>(
+        #[case] paths: impl IntoIterator<Item = &'a str>,
         #[case] excludes: impl IntoIterator<Item = &'a str>,
-        #[case] exclude_ignoreds: impl IntoIterator<Item = &'a str>,
         #[case] expected: impl IntoIterator<Item = &'a str>,
     ) {
         fn path_sort_asc_fn(a: impl AsRef<Path>, b: impl AsRef<Path>) -> std::cmp::Ordering {
@@ -781,7 +847,8 @@ mod tests {
                 .cmp(&b.ancestors().count())
                 .then_with(|| a.cmp(b))
         }
-        let mut ignoreds = find(["."], excludes, exclude_ignoreds).unwrap();
+        let mut ignoreds = find(paths, excludes).unwrap();
+        // let mut ignoreds = find(["."], excludes, exclude_ignoreds).unwrap();
         // let mut ignoreds = find(["."], excludes, exclude_ignoreds).unwrap();
         // ignoreds.sort_unstable_by_key(|p| (std::cmp::Reverse(p.ancestors().count()), p));
         ignoreds.sort_unstable_by(|a, b| path_sort_asc_fn(a, b));
@@ -791,5 +858,37 @@ mod tests {
             .sorted_unstable_by(|a, b| path_sort_asc_fn(a, b))
             .collect::<Vec<PathBuf>>();
         assert_eq!(ignoreds, expected);
+    }
+
+    #[rstest]
+    #[case(
+        ["a", "build", "build/1.txt", "build/2.txt"],
+        [
+            ("a", &[] as &[_]),
+            ("build", &["build/1.txt", "build/2.txt"]),
+            ("build/1.txt", &[]),
+            ("build/2.txt", &[]),
+        ]
+    )]
+    fn test_get_one_level_subpaths<'a>(
+        #[case] paths: impl IntoIterator<Item = &'a str>,
+        #[case] expected: impl IntoIterator<Item = (&'a str, &'a [&'a str])>,
+    ) {
+        let subpaths = get_one_level_subpaths(paths);
+        let expected = expected
+            .into_iter()
+            .map(|(p, paths)| {
+                (
+                    Path::new(p),
+                    if paths.is_empty() {
+                        None
+                    } else {
+                        Some(paths.iter().copied().collect::<HashSet<_>>())
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(subpaths, expected);
     }
 }

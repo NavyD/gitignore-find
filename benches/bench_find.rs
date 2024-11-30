@@ -7,20 +7,13 @@ fn criterion_benchmark(c: &mut Criterion) {
     // let mut group = c.benchmark_group("sample-size-find");
     // group.significance_level(0.1).sample_size(500);
     c.bench_function("gitignore find", |b| {
-        b.iter(|| {
-            gitignore_find::find(
-                [&cwd],
-                [format!("{cwd}/.git/**")],
-                ["**/.venv/bin/activate"],
-            )
-            .unwrap()
-        })
+        b.iter(|| gitignore_find::find([&cwd], ["**/.env"]).unwrap())
     });
 }
 
 criterion_group! {
     name = benches;
-    config = Criterion::default().sample_size(20);
+    config = Criterion::default().sample_size(10);
     targets = criterion_benchmark
 }
 criterion_main!(benches);

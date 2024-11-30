@@ -13,8 +13,6 @@ struct Args {
     paths: Vec<String>,
     #[arg(short, long)]
     excludes: Vec<String>,
-    #[arg(short = 'i', long)]
-    exclude_ignoreds: Vec<String>,
 }
 
 fn main() -> Result<()> {
@@ -25,12 +23,12 @@ fn main() -> Result<()> {
         .is_test(true)
         .format_timestamp_millis()
         .filter_level(log::LevelFilter::Error)
-        .filter_module("gitignore_find", log::LevelFilter::Debug)
+        .filter_module("gitignore_find", log::LevelFilter::Trace)
         .init();
 
     let args = Args::parse();
 
-    let ignoreds = gitignore_find::find(&args.paths, &args.excludes, &args.exclude_ignoreds)?;
+    let ignoreds = gitignore_find::find(&args.paths, &args.excludes)?;
     println!(
         "{}",
         ignoreds.iter().map(|p| p.display().to_string()).join("\n")
