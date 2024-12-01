@@ -21,7 +21,7 @@ name = "navyd"
 
 [project.urls]
 Repository = "https://github.com/NavyD/gitignore-find"
-Changelog = "https://github.com/NavyD/gitignore-find/blob/main/CHANGELOG.md"
+Changelog = "https://github.com/NavyD/gitignore-find/blob/master/CHANGELOG.md"
 
 
 [tool.maturin]
