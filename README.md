@@ -37,22 +37,35 @@ print("\n".join(ignoreds))
 
 ## 性能
 
-在6核9750H SSD设备 wsl debian中运行下面是测试示例从home目录13万个路径中的1024个`.gitignore`文件找出忽略路径的用时是5秒不到
+在6核9750H SSD设备 wsl debian中运行下面是测试示例从home目录60万个路径中的1061个`.gitignore`文件找出忽略路径的用时是5秒左右，如果有缓存可以减少到2秒不到
 
 ```console
-$ time cargo run -r --example find -- -e '**/.env' ~ >/dev/null
-    Finished `release` profile [optimized] target(s) in 0.11s
-     Running `target/release/examples/find -e '**/.env' /home/navyd`
-[2024-11-30T07:19:12.740Z DEBUG gitignore_find] Finding git ignored paths with exclude globs ["**/.env"] in 1 paths: ["/home/navyd"]
-[2024-11-30T07:19:12.741Z DEBUG gitignore_find] Finding .gitignore files in /home/navyd path
-[2024-11-30T07:19:12.741Z TRACE gitignore_find] Traversing paths in directory /home/navyd
-[2024-11-30T07:19:13.301Z DEBUG gitignore_find] Finding ignored paths with 1041 gitignores and exclude pattern GlobPathPattern { patterns: ["**/.env"] } in /home/navyd
-[2024-11-30T07:19:13.301Z TRACE gitignore_find] Traversing paths in directory /home/navyd
-[2024-11-30T07:19:16.582Z DEBUG gitignore_find] Found 138947 ignored paths for all paths "/home/navyd"
-[2024-11-30T07:19:16.582Z TRACE gitignore_find] Excluding 138947 paths using glob pattern: GlobPathPattern { patterns: ["**/.env"] }
-[2024-11-30T07:19:16.926Z TRACE gitignore_find] Getting sub paths from 138943 ignoreds paths
-[2024-11-30T07:19:17.178Z TRACE gitignore_find] Traversing all sub paths of 1041 .gitignore paths
-[2024-11-30T07:19:17.186Z DEBUG gitignore_find] Merging 138943 ignored paths
-[2024-11-30T07:19:17.294Z DEBUG gitignore_find] Found 969 ignored paths for ["/home/navyd"]
-cargo run -r --example find -- -e '**/.env' ~ > /dev/null   7.40s  user 4.80s system 257% cpu 4.730 total
+$ hyperfine --warmup 3 'target/release/examples/find ~'
+Benchmark 1: target/release/examples/find ~
+  Time (mean ± σ):      1.813 s ±  0.072 s    [User: 9.317 s, System: 3.497 s]
+  Range (min … max):    1.743 s …  1.945 s    10 runs
+
+$ hyperfine --prepare 'sync; echo 3 | sudo -n tee /proc/sys/vm/drop_caches' 'target/release/examples/find ~'
+Benchmark 1: target/release/examples/find ~
+  Time (mean ± σ):      5.167 s ±  0.179 s    [User: 12.203 s, System: 11.762 s]
+  Range (min … max):    4.875 s …  5.557 s    10 runs
+
+$ echo 3 | sudo -n tee /proc/sys/vm/drop_caches >/dev/null; time target/release/examples/find ~ >/dev/null
+[2024-12-01T04:46:54.270Z DEBUG gitignore_find] Finding git ignored paths with exclude globs [] in 1 paths: ["/home/navyd"]
+[2024-12-01T04:46:54.270Z DEBUG gitignore_find] Finding all paths in /home/navyd
+[2024-12-01T04:46:54.270Z TRACE gitignore_find] Traversing paths in directory /home/navyd
+[2024-12-01T04:46:57.577Z TRACE gitignore_find] Found 611706 paths for /home/navyd
+[2024-12-01T04:46:57.984Z DEBUG gitignore_find] Finding ignored paths with 1061 gitignores and exclude pattern GlobPathPattern { patterns: [] } in /home/navyd
+[2024-12-01T04:46:58.831Z DEBUG gitignore_find] Found 120054 ignored paths for all paths "/home/navyd"
+[2024-12-01T04:46:58.851Z TRACE gitignore_find] Getting sub paths from 120054 ignoreds paths
+[2024-12-01T04:46:59.241Z TRACE gitignore_find] Traversing all sub paths of 1061 .gitignore paths
+[2024-12-01T04:46:59.252Z DEBUG gitignore_find] Merging 120054 ignored paths
+[2024-12-01T04:46:59.330Z DEBUG gitignore_find] Found 984 ignored paths for ["/home/navyd"]
+target/release/examples/find ~ > /dev/null   11.92s  user 11.44s system 460% cpu 5.074 total
+avg shared (code):         0 KB
+avg unshared (data/stack): 0 KB
+total (sum):               0 KB
+max memory:                207 MB
+page faults from disk:     33
+other page faults:         2994
 ```

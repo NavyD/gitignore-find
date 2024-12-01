@@ -36,7 +36,7 @@ use std::collections::{HashMap, HashSet};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const PARALLEL_PATH_SIZE: usize = 50000;
+const PARALLEL_PATH_SIZE: usize = 200000;
 
 /// A Python module implemented in Rust.
 #[cfg(not(tarpaulin_include))]
@@ -228,16 +228,18 @@ fn find_gitignoreds<'a>(
     exclude_pat: &(impl PathPattern + Debug + 'a),
 ) -> Result<impl Iterator<Item = PathBuf>> {
     let path = path.as_ref();
-    let take_parent_path = |p: &&Path| *p != path;
 
-    debug!("Finding .gitignore files in {}", path.display());
+    debug!("Finding all paths in {}", path.display());
+    let paths = find_all_paths_iter(path).collect::<Vec<_>>();
+    trace!("Found {} paths for {}", paths.len(), path.display());
 
-    let gitignores = find_all_paths_iter(path)
+    let gitignores = paths
+        .iter()
         .filter(|path| {
             path.file_name().and_then(|s| s.to_str()) == Some(".gitignore") && path.is_file()
         })
         .map(|p| {
-            let (gi, err) = Gitignore::new(&p);
+            let (gi, err) = Gitignore::new(p);
             if let Some(e) = err {
                 warn!("Ignore load gitignore rule error in {}: {}", p.display(), e);
             }
@@ -264,42 +266,53 @@ fn find_gitignoreds<'a>(
         exclude_pat,
         path.display(),
     );
-    let ignoreds = find_all_paths_iter(path)
-        // NOTE: 除非数据量上百万
-        // .par_bridge()
-        .filter(|p| {
-            let keep = p
-                .ancestors()
-                .take_while_inclusive(take_parent_path)
-                // 仅使用首个gitignore文件匹配
-                .find_map(|pp| gitignores.get(pp))
-                .map(|gi| {
-                    // 提前检查当前路径是否为gitignore目录
-                    if gi.path() == p {
-                        // gi目录路径必为true
-                        gi.matched(p, true).is_ignore()
-                    } else {
-                        p.ancestors()
-                            // 不包含gitignore目录 避免其父路径可能由于`*`规则导致忽略
-                            .take_while(|newpp| *newpp != gi.path())
-                            .any(|newp| {
-                                // p的父路径必为目录true
-                                let v = gi.matched(newp, newp != p || newp.is_dir()).is_ignore();
-                                #[cfg(test)]
-                                if newp.ancestors().any(|p| p.ends_with("build")) {
-                                    print!("");
-                                }
-                                v
-                            })
-                    }
-                })
-                .unwrap_or(false);
-            #[cfg(test)]
-            print!("");
-            keep
-        })
-        .map(Rc::new)
-        .collect::<Vec<_>>();
+    let take_parent_path = |p: &&Path| *p != path;
+    let filter_ignored = |p: &PathBuf| {
+        let keep = p
+            .ancestors()
+            .take_while_inclusive(take_parent_path)
+            // 仅使用首个gitignore文件匹配
+            .find_map(|pp| gitignores.get(pp))
+            .map(|gi| {
+                // 提前检查当前路径是否为gitignore目录
+                if gi.path() == p {
+                    // gi目录路径必为true
+                    gi.matched(p, true).is_ignore()
+                } else {
+                    p.ancestors()
+                        // 不包含gitignore目录 避免其父路径可能由于`*`规则导致忽略
+                        .take_while(|newpp| *newpp != gi.path())
+                        .any(|newp| {
+                            // p的父路径必为目录true
+                            let v = gi.matched(newp, newp != p || newp.is_dir()).is_ignore();
+                            #[cfg(test)]
+                            if newp.ancestors().any(|p| p.ends_with("build")) {
+                                print!("");
+                            }
+                            v
+                        })
+                }
+            })
+            .unwrap_or(false);
+        #[cfg(test)]
+        print!("");
+        keep
+    };
+    let ignoreds = if paths.len() < PARALLEL_PATH_SIZE {
+        paths
+            .into_iter()
+            .filter(filter_ignored)
+            .map(Rc::new)
+            .collect::<Vec<_>>()
+    } else {
+        paths
+            .into_par_iter()
+            .filter(filter_ignored)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(Rc::new)
+            .collect::<Vec<_>>()
+    };
     debug!(
         "Found {} ignored paths for all paths {:?}{}",
         ignoreds.len(),
@@ -411,11 +424,12 @@ fn find_gitignoreds<'a>(
             String::new()
         }
     );
+    #[cfg(not(debug_assertions))]
+    let gitignores_it = gitignores.par_keys();
+    #[cfg(debug_assertions)]
+    let gitignores_it = gitignores.keys().par_bridge();
     // 获取gitignore目录对应的一层实际子路径  用于与ignoreds子路径对比是否一致
-    let gitignore_subpaths = gitignores
-        .keys()
-        .par_bridge()
-        // .par_keys()
+    let gitignore_subpaths = gitignores_it
         .map(|p| {
             let p = p.as_path();
             // NOTE: 当ignored_subpaths的paths=None时表示这个p对应子路径不存在
