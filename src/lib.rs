@@ -1,6 +1,6 @@
 use core::panic;
 use std::{
-    fmt::Debug,
+    fmt::{Debug, Display},
     hash::Hash,
     path::{Path, PathBuf},
     rc::Rc,
@@ -17,11 +17,12 @@ use pyo3::{
     prelude::*,
     types::{PySequence, PyString},
 };
+#[cfg(feature = "digest")]
 use sha2::{Digest, Sha256};
 
-#[cfg(not(debug_assertions))]
+#[cfg(feature = "hashbrown")]
 use hashbrown::{HashMap, HashSet};
-#[cfg(debug_assertions)]
+#[cfg(not(feature = "hashbrown"))]
 use std::collections::{HashMap, HashSet};
 
 #[cfg(all(
@@ -37,6 +38,9 @@ use std::collections::{HashMap, HashSet};
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const PARALLEL_PATH_SIZE: usize = 200000;
+
+/// `.gitignore`文件名
+const GITIGNORE_NAME: &str = ".gitignore";
 
 /// A Python module implemented in Rust.
 #[cfg(not(tarpaulin_include))]
@@ -101,7 +105,6 @@ pub fn find(
 }
 
 fn find_all_paths_iter(path: impl AsRef<Path>) -> impl Iterator<Item = PathBuf> {
-    trace!("Traversing paths in directory {}", path.as_ref().display());
     WalkDir::new(path)
         .skip_hidden(false)
         .process_read_dir(move |_depth, _path, _read_dir_state, children| {
@@ -135,6 +138,7 @@ trait PathPattern {
     fn is_empty(&self) -> bool;
 }
 
+#[derive(Debug)]
 struct GlobPathPattern {
     set: globset::GlobSet,
     patterns: Vec<String>,
@@ -171,12 +175,9 @@ impl PathPattern for GlobPathPattern {
     }
 }
 
-impl Debug for GlobPathPattern {
+impl Display for GlobPathPattern {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GlobPathPattern")
-            // .field("set", &self.set)
-            .field("patterns", &self.patterns)
-            .finish()
+        write!(f, "[{}]", self.patterns.join(", "))
     }
 }
 
@@ -187,8 +188,6 @@ impl<T: AsRef<str>> TryFrom<&[T]> for GlobPathPattern {
         GlobPathPattern::new(value)
     }
 }
-
-type PathDigestTy = [u8; 32];
 
 /// 对于path中所有的`.gitignore`，返回所有被其忽略的文件和目录。
 ///
@@ -223,20 +222,25 @@ type PathDigestTy = [u8; 32];
 ///
 /// 在比较子路径时如果数量较大时会导致内存和比较时消耗过大，可以使用hash排序生成digest比较，
 /// 但在ignoreds数量在10万级以下基本是负收益
+///
+/// 注意：对于subpaths使用[`PathBuf`]而不是`&Path`，首先是比较方便，且由于一层子路径通常较小，开销不大，
+/// 如果改用引用需要保存all paths直到程序结束，且需要使用Arc，不太方便，没有大收益。
+/// 使用digest只有在子路径非常大时有用，但对于一层子路径就没有什么必要了
 fn find_gitignoreds<'a>(
     path: impl AsRef<Path>,
-    exclude_pat: &(impl PathPattern + Debug + 'a),
+    exclude_pat: &(impl PathPattern + Display + 'a),
 ) -> Result<impl Iterator<Item = PathBuf>> {
     let path = path.as_ref();
 
-    debug!("Finding all paths in {}", path.display());
-    let paths = find_all_paths_iter(path).collect::<Vec<_>>();
-    trace!("Found {} paths for {}", paths.len(), path.display());
+    debug!("Traversing all paths in {}", path.display());
+    let all_paths = find_all_paths_iter(path).collect::<Vec<_>>();
+    trace!("Found {} paths for {}", all_paths.len(), path.display());
 
-    let gitignores = paths
+    debug!("Finding .gitignore files from {} paths", all_paths.len());
+    let gitignores = all_paths
         .iter()
         .filter(|path| {
-            path.file_name().and_then(|s| s.to_str()) == Some(".gitignore") && path.is_file()
+            path.file_name().and_then(|s| s.to_str()) == Some(GITIGNORE_NAME) && path.is_file()
         })
         .map(|p| {
             let (gi, err) = Gitignore::new(p);
@@ -260,8 +264,42 @@ fn find_gitignoreds<'a>(
         gitignores.keys().collect_vec(),
     );
 
+    // 获取gitignore目录对应的一层实际子路径  用于与ignoreds子路径对比是否一致
+    // NOTE: `.git`目录在遍历时忽略了，实际获取的路径不应该再加入.git目录，用于检查一致不需要这个.git目录，不会影响结果
+    let gitignore_subpaths = all_paths
+        .iter()
+        .fold(HashMap::<_, Option<_>>::new(), |mut m, p| {
+            if let Some(pp) = p.parent().filter(|pp| gitignores.contains_key(*pp)) {
+                #[cfg(not(feature = "digest"))]
+                if let Some(v) = m
+                    .entry(pp.to_path_buf())
+                    .or_insert_with(|| Some(HashSet::new()))
+                {
+                    v.insert(p.to_path_buf());
+                }
+                #[cfg(feature = "digest")]
+                if let Some(v) = m.entry(pp.to_path_buf()).or_insert_with(|| Some(vec![])) {
+                    v.push(p);
+                }
+            }
+            m
+        });
+    #[cfg(feature = "digest")]
+    // 猜测子路径路数较小 不准确
+    let gitignore_subpaths = if gitignore_subpaths.len() < 500 {
+        gitignore_subpaths
+            .into_iter()
+            .map(|(p, subpaths)| (p, subpaths.map(gen_digest)))
+            .collect::<HashMap<_, _>>()
+    } else {
+        gitignore_subpaths
+            .into_par_iter()
+            .map(|(p, subpaths)| (p, subpaths.map(gen_digest)))
+            .collect::<HashMap<_, _>>()
+    };
+
     debug!(
-        "Finding ignored paths with {} gitignores and exclude pattern {:?} in {}",
+        "Finding ignored paths with {} gitignores and exclude pattern {} in {}",
         gitignores.len(),
         exclude_pat,
         path.display(),
@@ -298,14 +336,14 @@ fn find_gitignoreds<'a>(
         print!("");
         keep
     };
-    let ignoreds = if paths.len() < PARALLEL_PATH_SIZE {
-        paths
+    let ignoreds = if all_paths.len() < PARALLEL_PATH_SIZE {
+        all_paths
             .into_iter()
             .filter(filter_ignored)
             .map(Rc::new)
             .collect::<Vec<_>>()
     } else {
-        paths
+        all_paths
             .into_par_iter()
             .filter(filter_ignored)
             .collect::<Vec<_>>()
@@ -326,7 +364,7 @@ fn find_gitignoreds<'a>(
     // 如果一个路径被排除则其所有存在的父路径应该被移除，避免后续被合并到父路径中
     let ignoreds = if !exclude_pat.is_empty() {
         trace!(
-            "Excluding {} paths using glob pattern: {:?}",
+            "Excluding {} paths using glob pattern: {}",
             ignoreds.len(),
             exclude_pat
         );
@@ -364,6 +402,7 @@ fn find_gitignoreds<'a>(
             .collect_vec();
         drop(set);
         drop(ignoreds);
+        trace!("Found {} paths excluded by globs: {}", v.len(), exclude_pat);
         v
     } else {
         ignoreds
@@ -373,26 +412,26 @@ fn find_gitignoreds<'a>(
     let ignoreds_set = ignoreds.iter().map(|p| p.as_path()).collect::<HashSet<_>>();
     // 用于检查子路径是否一致
     let ignored_subpaths = {
-        trace!("Getting sub paths from {} ignoreds paths", ignoreds.len());
+        trace!("Finding sub paths from {} ignoreds paths", ignoreds.len());
         let subpaths = get_one_level_subpaths(ignoreds.iter().map(|p| p.as_path()));
 
-        #[cfg(debug_assertions)]
+        #[cfg(not(feature = "digest"))]
         type MapTy = HashSet<PathBuf>;
-        #[cfg(not(debug_assertions))]
+        #[cfg(feature = "digest")]
         type MapTy = PathDigestTy;
         fn to_digest<'a>(
             (p, paths): (&'a Path, Option<HashSet<&'a Path>>),
         ) -> (&'a Path, Option<MapTy>) {
             (
                 p,
-                #[cfg(debug_assertions)]
+                #[cfg(not(feature = "digest"))]
                 paths.map(|paths| {
                     paths
                         .into_iter()
                         .map(ToOwned::to_owned)
                         .collect::<HashSet<_>>()
                 }),
-                #[cfg(not(debug_assertions))]
+                #[cfg(feature = "digest")]
                 paths.map(gen_digest),
             )
         }
@@ -409,47 +448,6 @@ fn find_gitignoreds<'a>(
                 .collect::<HashMap<_, _>>()
         }
     };
-    trace!(
-        "Traversing all sub paths of {} .gitignore paths{}",
-        gitignores.len(),
-        if cfg!(all(debug_assertions, test)) {
-            format!(
-                ": {:?}",
-                gitignores
-                    .keys()
-                    .map(|p| p.display().to_string())
-                    .collect_vec()
-            )
-        } else {
-            String::new()
-        }
-    );
-    #[cfg(not(debug_assertions))]
-    let gitignores_it = gitignores.par_keys();
-    #[cfg(debug_assertions)]
-    let gitignores_it = gitignores.keys().par_bridge();
-    // 获取gitignore目录对应的一层实际子路径  用于与ignoreds子路径对比是否一致
-    let gitignore_subpaths = gitignores_it
-        .map(|p| {
-            let p = p.as_path();
-            // NOTE: 当ignored_subpaths的paths=None时表示这个p对应子路径不存在
-            // 或所有路径均被忽略了  保存一致方便比较
-            if ignored_subpaths
-                .get(p)
-                .map_or(false, |paths| paths.is_none())
-            {
-                return Ok((p, None));
-            }
-            let paths = std::fs::read_dir(p)?
-                .map_ok(|p| p.path())
-                .collect::<Result<HashSet<_>, _>>()?;
-            #[cfg(debug_assertions)]
-            let v = paths;
-            #[cfg(not(debug_assertions))]
-            let v = gen_digest(paths);
-            Ok::<_, Error>((p, Some(v)))
-        })
-        .collect::<Result<HashMap<_, _>>>()?;
 
     debug!("Merging {} ignored paths", ignoreds.len());
     let mergeds = ignoreds
@@ -503,7 +501,7 @@ fn find_gitignoreds<'a>(
     Ok(mergeds.into_iter().map(|p| Rc::try_unwrap(p).unwrap()))
 }
 
-#[allow(dead_code)]
+#[cfg(feature = "digest")]
 fn gen_digest(paths: impl IntoIterator<Item: AsRef<Path> + Ord>) -> PathDigestTy {
     paths
         .into_iter()
@@ -579,6 +577,9 @@ where
     )
 }
 
+#[cfg(feature = "digest")]
+type PathDigestTy = [u8; 32];
+
 /// 生成所有路径对应的 递归所有子路径 的digests。
 ///
 /// 如果一个路径没有子路径则`digest=None`
@@ -588,6 +589,7 @@ where
 /// 排序后自低向上查找每个路径对应的子路径。对于每个路径，使用子路径的digest计算digest，
 /// 不会真的检查递归的子路径，算法复杂度是O(N)
 #[allow(dead_code)]
+#[cfg(feature = "digest")]
 fn gen_all_subpath_digests<P>(
     paths: impl IntoIterator<Item = P>,
 ) -> impl Iterator<Item = (P, Option<PathDigestTy>)>
@@ -727,7 +729,7 @@ mod tests {
                     std::fs::create_dir_all(p).unwrap();
                 }
                 assert!(
-                    gitignore_path.ends_with(".gitignore"),
+                    gitignore_path.ends_with(GITIGNORE_NAME),
                     "not found .gitignore suffix for {}",
                     gitignore_path.display()
                 );
@@ -772,35 +774,35 @@ mod tests {
     #[rstest]
     #[case::all_empty([], [], [], [])]
     #[case::no_gitignore_and_no_excludes(["1.txt", ".env", ".envrc"], [], [], [])]
-    #[case::no_excludes(["1.txt", ".env", ".envrc"], [(".gitignore", &[".env*"] as &[&str])], [], [".env", ".envrc"])]
+    #[case::no_excludes(["1.txt", ".env", ".envrc"], [(GITIGNORE_NAME, &[".env*"] as &[&str])], [], [".env", ".envrc"])]
     #[case::no_gitignore(["1.txt", ".env", ".envrc"], [], ["**/.env"], [])]
     #[case::exclude_env(
         ["1.txt", ".env", ".envrc"],
-        [(".gitignore", &[".env*"] as &[&str])],
+        [(GITIGNORE_NAME, &[".env*"] as &[&str])],
         ["**/.env"],
         [".envrc"]
     )]
     #[case::nest_excludes(
         ["1.txt", ".env", ".envrc", ".venv/bin/test.sh", ".venv/lib/a.pth"],
-        [(".gitignore", &[".env*", ".venv"]as &[&str])],
+        [(GITIGNORE_NAME, &[".env*", ".venv"]as &[&str])],
         ["**/.env", "**/.venv/**", "**/.venv"],
         [".envrc"]
     )]
     #[case::nest_excludes(
         ["1.txt", ".env", ".envrc", ".venv/bin/test.sh", ".venv/lib/a.pth", ".venv/pyvenv.cfg"],
-        [(".gitignore", &[".env*", ".venv"] as &[&str])],
+        [(GITIGNORE_NAME, &[".env*", ".venv"] as &[&str])],
         ["**/.env", "**/.venv/bin", "**/.venv/bin/**"],
         [".envrc", ".venv/lib", ".venv/pyvenv.cfg"],
     )]
     #[case::nest_excludes_without_globself(
         ["1.txt", ".env", ".envrc", ".venv/bin/test.sh", ".venv/lib/a.pth", ".venv/pyvenv.cfg"],
-        [(".gitignore", &[".env*", ".venv"] as &[&str])],
+        [(GITIGNORE_NAME, &[".env*", ".venv"] as &[&str])],
         ["**/.env", "**/.venv/bin/**"],
         [".envrc", ".venv/lib", ".venv/pyvenv.cfg"],
     )]
     #[case::nest_gitignores(
         ["1.txt", ".env", ".envrc", ".venv/bin/test.sh", ".venv/lib/a.pth", ".venv/pyvenv.cfg", "build/a.txt", "build/1.txt"],
-        [(".gitignore", &[".env*", ".venv"] as &[&str]), ("build/.gitignore", &["*", "!a.txt"])],
+        [(GITIGNORE_NAME, &[".env*", ".venv"] as &[&str]), ("build/.gitignore", &["*", "!a.txt"])],
         ["**/.env", "**/.venv/bin/**"],
         [".envrc", ".venv/lib", ".venv/pyvenv.cfg", "build/1.txt", "build/.gitignore"],
     )]
@@ -924,6 +926,7 @@ mod tests {
         ["1.txt", ".env", ".envrc", ".venv", ".venv/notbin", ".venv/notbin/test.sh", ".venv/lib/b.pth", ".venv/pyvenv.cfg"],
         false,
     )]
+    #[cfg(feature = "digest")]
     fn test_gen_all_subpath_digests<'a>(
         #[case] paths: impl IntoIterator<Item = &'a str>,
         #[case] other_paths: impl IntoIterator<Item = &'a str>,

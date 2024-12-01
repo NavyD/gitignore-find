@@ -26,8 +26,8 @@ pyo3 = { version = "0.23", features = [
     # 要求python3.9及以上
     "abi3-py39",
 ] }
-sha2 = "0.10"
-hashbrown = { version = "0.15", features = ["rayon"] }
+sha2 = { version = "0.10", optional = true }
+hashbrown = { version = "0.15", features = ["rayon"], optional = true }
 pyo3-log = "0.12"
 
 # 在gnu linux非x86平台可能会构建失败
@@ -45,13 +45,19 @@ dhat = "0.3"
 clap = { version = "4.5", features = ["derive"] }
 
 [features]
+# default = ["digest"]
 dhat-heap = []
+hashbrown = ["dep:hashbrown"]
+digest = ["dep:sha2"]
 
 # 使用命令`cargo bench`统计性能
 # https://github.com/bheisler/criterion.rs
 [[bench]]
 name = "bench_find"
 harness = false
+
+[[example]]
+name = "find"
 
 # 使用`cargo flamegraph --bench bench_find`生成火焰图
 # https://github.com/flamegraph-rs/flamegraph#usage-with-benchmarks

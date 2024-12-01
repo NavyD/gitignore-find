@@ -25,7 +25,11 @@ Changelog = "https://github.com/NavyD/gitignore-find/blob/master/CHANGELOG.md"
 
 
 [tool.maturin]
-features = ["pyo3/extension-module"]
+features = ["pyo3/extension-module", "hashbrown"]
+# Activate all available features
+all-features = false
+# Do not activate the `default` feature
+no-default-features = false
 
 
 [tool.commitizen]
