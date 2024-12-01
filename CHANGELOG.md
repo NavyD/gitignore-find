@@ -1,3 +1,9 @@
+## v1.2.0 (2024-12-01)
+
+### Feat
+
+- add features and avoid reading io when getting gitignore subpaths
+
 ## v1.1.0 (2024-12-01)
 
 ### Feat
