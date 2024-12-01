@@ -5,6 +5,7 @@ ci:
 default_install_hook_types:
   - pre-commit
   - commit-msg
+  - pre-push
 fail_fast: true
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -40,8 +41,10 @@ repos:
       - id: clippy
         stages: [pre-commit]
         args: [--all, --all-targets, --no-deps]
+      - id: build
+      - id: test
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.8.0
+    rev: v0.8.1
     hooks:
       - id: ruff
         stages: [pre-commit]
