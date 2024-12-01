@@ -1,3 +1,9 @@
+## v1.1.0 (2024-12-01)
+
+### Feat
+
+- Cache paths to improve performance
+
 ## v1.0.0 (2024-11-30)
 
 ### Feat
