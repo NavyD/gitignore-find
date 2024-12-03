@@ -1,0 +1,3 @@
+--action-offline-mode
+--secret-file .env
+--eventpath .github/actions/act-rustup/event.json

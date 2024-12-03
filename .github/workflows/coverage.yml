@@ -1,0 +1,44 @@
+name: coverage
+
+on:
+  push:
+    branches: ["*"]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  coverage:
+    name: Collect test coverage
+    runs-on: ubuntu-latest
+    if: ${{ github.event.act || github.ref == 'refs/heads/master' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/act-rustup
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          # for cargo-llvm-cov
+          components: llvm-tools-preview
+      - name: Cache cargo-llvm-cov
+        id: cache-cargo-llvm-cov
+        if: ${{ env.ACT }}
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-llvm-cov
+          key: act-cargo-llvm-cov-${{ runner.os }}-${{ github.sha }}
+      - name: Install cargo-llvm-cov
+        if: ${{ !env.ACT || steps.cache-cargo-llvm-cov.outputs.cache-hit != 'true' }}
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Collect coverage data
+        run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+      - name: Upload coverage data to codecov
+        uses: codecov/codecov-action@v5
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        with:
+          files: lcov.info
+          fail_ci_if_error: true
