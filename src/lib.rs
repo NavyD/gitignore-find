@@ -801,7 +801,7 @@ mod tests {
         [".envrc", ".venv/lib", ".venv/pyvenv.cfg"],
     )]
     #[case::nest_gitignores(
-        ["1.txt", ".env", ".envrc", ".venv/bin/test.sh", ".venv/lib/a.pth", ".venv/pyvenv.cfg", "build/a.txt", "build/1.txt"],
+        [".git/HEAD", "1.txt", ".env", ".envrc", ".venv/bin/test.sh", ".venv/lib/a.pth", ".venv/pyvenv.cfg", "build/a.txt", "build/1.txt"],
         [(GITIGNORE_NAME, &[".env*", ".venv"] as &[&str]), ("build/.gitignore", &["*", "!a.txt"])],
         ["**/.env", "**/.venv/bin/**"],
         [".envrc", ".venv/lib", ".venv/pyvenv.cfg", "build/1.txt", "build/.gitignore"],
