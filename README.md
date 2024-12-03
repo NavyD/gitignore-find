@@ -1,5 +1,10 @@
 # gitignore-find
 
+[![PyPI latest version](https://img.shields.io/pypi/v/gitignore-find?style=flat-square&logo=python)](https://pypi.org/project/gitignore-find)
+[![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/navyd/gitignore-find/CI.yml?event=push&style=flat-square)](https://github.com/NavyD/gitignore-find/actions)
+[![codecov](https://codecov.io/gh/NavyD/gitignore-find/graph/badge.svg?token=D1EKOEJEOS)](https://codecov.io/gh/NavyD/gitignore-find)
+[![GitHub License:Apache-2.0](https://img.shields.io/github/license/navyd/gitignore-find?style=flat-square)](https://github.com/navyd/gitignore-find/blob/master/LICENSE)
+
 查找指定目录下所有被`.gitignore`文件忽略的路径，功能与`git check-ignore **/*`类似：
 
 * 允许指定多个目录并检查其中所有的`.gitignore`文件
